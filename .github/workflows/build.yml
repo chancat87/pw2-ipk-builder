@@ -14,12 +14,12 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-22.04
-
     steps:
       - name: Checkout repo (packages.txt)
         uses: actions/checkout@v4
 
       - name: Install deps
+        shell: bash
         run: |
           set -e
           sudo apt-get update
@@ -30,6 +30,7 @@ jobs:
 
       - name: Resolve passwall2 tag (input or latest)
         id: rel
+        shell: bash
         run: |
           set -e
           IN="${{ github.event.inputs.passwall2_tag }}"
@@ -38,23 +39,26 @@ jobs:
             exit 0
           fi
           TAG="$(curl -fsSL https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall2/releases/latest | jq -r .tag_name)"
-          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "Failed to fetch latest tag" >&2; exit 1; }
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "Failed to fetch latest tag" >&2
+            exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Clone ImmortalWrt buildroot v21.02.7
+        shell: bash
         run: |
           set -e
           git clone --depth 1 --branch v21.02.7 https://github.com/immortalwrt/immortalwrt.git openwrt
 
       - name: Add feeds, update all, pin passwall2 to tag
+        shell: bash
         run: |
           set -e
           cd openwrt
 
-          printf '%s\n' \
-            "src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git;main" \
-            "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git;main" \
-            >> feeds.conf.default
+          echo "src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git;main" >> feeds.conf.default
+          echo "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git;main" >> feeds.conf.default
 
           ./scripts/feeds update -a
           ./scripts/feeds install -a
@@ -64,17 +68,17 @@ jobs:
           git checkout -f "${{ steps.rel.outputs.tag }}"
 
       - name: Select target (aarch64_cortex-a53 via mediatek/mt7622)
+        shell: bash
         run: |
           set -e
           cd openwrt
           : > .config
-          printf '%s\n' \
-            "CONFIG_TARGET_mediatek=y" \
-            "CONFIG_TARGET_mediatek_mt7622=y" \
-            >> .config
+          echo "CONFIG_TARGET_mediatek=y" >> .config
+          echo "CONFIG_TARGET_mediatek_mt7622=y" >> .config
           make defconfig
 
       - name: Prepare build tools & toolchain (stable order)
+        shell: bash
         run: |
           set -e
           cd openwrt
@@ -82,6 +86,7 @@ jobs:
           make toolchain/install -j1 V=s
 
       - name: Append package selections
+        shell: bash
         run: |
           set -e
           cd openwrt
@@ -89,7 +94,7 @@ jobs:
           echo "CONFIG_PACKAGE_luci-app-passwall2=m" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-passwall2-zh-cn=m" >> .config
 
-          # 依赖包清单：每行一个“包名”
+          # packages.txt：每行一个“包名”（你已经有）
           while IFS= read -r p; do
             [ -z "$p" ] && continue
             echo "CONFIG_PACKAGE_${p}=m" >> .config
@@ -98,65 +103,72 @@ jobs:
           make defconfig
 
       - name: Build luci packages (must exist)
+        shell: bash
         run: |
           set -e
           cd openwrt
 
-          test -d package/feeds/passwall2/luci-app-passwall2 || {
-            echo "Missing: package/feeds/passwall2/luci-app-passwall2" >&2
+          if [ ! -d package/feeds/passwall2/luci-app-passwall2 ]; then
+            echo "Missing luci-app-passwall2 dir" >&2
             exit 1
-          }
-          test -d package/feeds/luci/luci-i18n-passwall2-zh-cn || {
-            echo "Missing: package/feeds/luci/luci-i18n-passwall2-zh-cn" >&2
-            echo "This means your base/feeds do not provide that i18n package." >&2
+          fi
+          if [ ! -d package/feeds/luci/luci-i18n-passwall2-zh-cn ]; then
+            echo "Missing luci-i18n-passwall2-zh-cn dir in luci feed" >&2
             exit 1
-          }
+          fi
 
           make package/feeds/passwall2/luci-app-passwall2/compile -j"$(nproc)" V=s
           make package/feeds/luci/luci-i18n-passwall2-zh-cn/compile -j"$(nproc)" V=s
 
-      - name: Build dependency packages by resolving directory from Package: name
+      - name: Build dependency packages (resolve dir by Package: name)
+        shell: bash
         run: |
           set -e
           cd openwrt
 
           FEEDROOT="package/feeds/passwall_packages"
-          test -d "$FEEDROOT" || { echo "Missing feed root: $FEEDROOT" >&2; exit 1; }
+          if [ ! -d "$FEEDROOT" ]; then
+            echo "Missing passwall_packages feed root: $FEEDROOT" >&2
+            exit 1
+          fi
 
           resolve_dir() {
-            # 返回声明了 "Package: <name>" 的 Makefile 所在目录
+            # find Makefile containing: Package: <name>
             local name="$1"
-            local mk
-            mk="$(grep -R --line-number --fixed-string "Package: $name" "$FEEDROOT" 2>/dev/null | head -n 1 | cut -d: -f1 || true)"
-            [ -n "$mk" ] || return 1
+            local mk=""
+            mk="$(grep -R --line-number --fixed-string "Package: $name" "$FEEDROOT" 2>/dev/null | head -n 1 | cut -d: -f1)"
+            if [ -z "$mk" ]; then
+              return 1
+            fi
             dirname "$mk"
           }
 
           while IFS= read -r p; do
             [ -z "$p" ] && continue
 
-            # 可选：simple-obfs-server 若你允许失败不断流，保留 true；否则删掉 || true
             if [ "$p" = "simple-obfs-server" ]; then
               DIR="$(resolve_dir "$p" || true)"
               if [ -n "$DIR" ]; then
                 echo "build optional: $p -> $DIR"
                 make "$DIR/compile" -j"$(nproc)" V=s || true
               else
-                echo "optional package not found in feed: $p"
+                echo "optional package not found: $p"
               fi
               continue
             fi
 
-            DIR="$(resolve_dir "$p")" || {
+            DIR="$(resolve_dir "$p" || true)"
+            if [ -z "$DIR" ]; then
               echo "Cannot find package in passwall_packages feed: $p" >&2
               exit 1
-            }
+            fi
 
             echo "build: $p -> $DIR"
             make "$DIR/compile" -j"$(nproc)" V=s
           done < ../packages.txt
 
       - name: Collect IPKs and create zip
+        shell: bash
         run: |
           set -e
           cd openwrt
@@ -166,7 +178,6 @@ jobs:
           find bin/packages -type f -name "luci-app-passwall2_*.ipk" -exec cp -f {} "$OUT/luci/" \;
           find bin/packages -type f -name "luci-i18n-passwall2-zh-cn_*.ipk" -exec cp -f {} "$OUT/luci/" \;
 
-          # deps：按包名抓对应 ipk（包名就是 ipk 文件名前缀）
           while IFS= read -r p; do
             [ -z "$p" ] && continue
             find bin/packages -type f -name "${p}_*.ipk" \
@@ -175,13 +186,14 @@ jobs:
               -exec cp -f {} "$OUT/deps/" \; || true
           done < ../packages.txt
 
-          (cd "$OUT/deps" && zip -9 -r "../passwall_packages_ipk_aarch64_cortex-a53.zip" .)
+          cd "$OUT/deps"
+          zip -9 -r "../passwall_packages_ipk_aarch64_cortex-a53.zip" .
 
       - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "ipk-${{ steps.rel.outputs.tag }}-a53"
-          name: "IPK (a53) for passwall2 ${{ steps.rel.outputs.tag }}"
+          tag_name: ipk-${{ steps.rel.outputs.tag }}-a53
+          name: IPK (a53) for passwall2 ${{ steps.rel.outputs.tag }}
           body: |
             Base: ImmortalWrt v21.02.7
             Target: mediatek/mt7622 (aarch64_cortex-a53)
