@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       passwall2_tag:
-        description: "Use openwrt-passwall2 tag. Empty = Latest Release tag."
+        description: "Use this openwrt-passwall2 tag. Empty = Latest Release tag."
         required: false
         default: ""
 
@@ -39,7 +39,7 @@ jobs:
           fi
           TAG="$(curl -fsSL https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall2/releases/latest | jq -r .tag_name)"
           if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-            echo "Failed to fetch latest release tag" >&2
+            echo "Failed to fetch latest tag" >&2
             exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -49,19 +49,14 @@ jobs:
           set -e
           git clone --depth 1 --branch v21.02.7 https://github.com/immortalwrt/immortalwrt.git openwrt
 
-      - name: Update/install default feeds then add passwall feeds and pin tag
+      - name: Add feeds and pin passwall2 to tag
         run: |
           set -e
           cd openwrt
 
-          # 1) 必须先拉取/安装默认 feeds（含 luci / packages / routing / telephony 等）
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-
-          # 2) 追加 passwall feeds
           printf '%s\n' \
-            "src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git" \
-            "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git" \
+            "src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git;main" \
+            "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git;main" \
             >> feeds.conf.default
 
           ./scripts/feeds update passwall2
@@ -69,44 +64,42 @@ jobs:
           ./scripts/feeds install -a -p passwall2
           ./scripts/feeds install -a -p passwall_packages
 
-          # 3) passwall2 feed checkout 到指定 tag（为空时为 Latest）
           cd feeds/passwall2
           git fetch --tags --force
           git checkout -f "${{ steps.rel.outputs.tag }}"
 
-      - name: Select target (ipq60xx/generic or fallback mt7622)
+      - name: Select target (aarch64_cortex-a53 via mediatek/mt7622)
         run: |
           set -e
           cd openwrt
 
           : > .config
           printf '%s\n' \
-            "CONFIG_TARGET_ipq60xx=y" \
-            "CONFIG_TARGET_ipq60xx_generic=y" \
+            "CONFIG_TARGET_mediatek=y" \
+            "CONFIG_TARGET_mediatek_mt7622=y" \
             >> .config
 
-          if make defconfig; then
-            echo "Using target ipq60xx/generic"
-          else
-            echo "Fallback to mediatek/mt7622"
-            : > .config
-            printf '%s\n' \
-              "CONFIG_TARGET_mediatek=y" \
-              "CONFIG_TARGET_mediatek_mt7622=y" \
-              >> .config
-            make defconfig
-          fi
+          make defconfig
+
+          echo "==> Selected targets (sanity):"
+          grep -E '^CONFIG_TARGET_' .config | head -n 50 || true
+
+      - name: Prepare build tools & toolchain (avoid race)
+        run: |
+          set -e
+          cd openwrt
+          make tools/install -j"$(nproc)" V=s
+          # toolchain 这里用 -j1 更稳，避免 staging 内文件缺失导致 libc 打包失败
+          make toolchain/install -j1 V=s
 
       - name: Append package selections
         run: |
           set -e
           cd openwrt
 
-          # pw2 luci
           echo "CONFIG_PACKAGE_luci-app-passwall2=m" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-passwall2-zh-cn=m" >> .config
 
-          # dependencies whitelist
           while IFS= read -r p; do
             [ -z "$p" ] && continue
             echo "CONFIG_PACKAGE_${p}=m" >> .config
@@ -114,11 +107,17 @@ jobs:
 
           make defconfig
 
-      - name: Build luci packages
+      - name: Build luci packages (print last 200 lines on failure)
         run: |
           set -e
           cd openwrt
-          make package/feeds/passwall2/luci-app-passwall2/compile -j"$(nproc)" V=s
+
+          make package/feeds/passwall2/luci-app-passwall2/compile -j"$(nproc)" V=s 2>&1 | tee /tmp/pw2_luci.log || {
+            echo "==== luci build failed, last 200 lines ===="
+            tail -n 200 /tmp/pw2_luci.log
+            exit 1
+          }
+
           make package/feeds/passwall2/luci-i18n-passwall2-zh-cn/compile -j"$(nproc)" V=s
 
       - name: Build dependency packages (simple-obfs-server optional)
@@ -131,7 +130,6 @@ jobs:
 
             if [ "$p" = "simple-obfs-server" ]; then
               echo "optional: $p"
-              # 目录通常是 simple-obfs
               make package/feeds/passwall_packages/simple-obfs/compile -j"$(nproc)" V=s || true
               continue
             fi
@@ -147,11 +145,9 @@ jobs:
           OUT="$PWD/out"
           mkdir -p "$OUT/deps" "$OUT/luci"
 
-          # luci ipk
           find bin/packages -type f -name "luci-app-passwall2_*.ipk" -exec cp -f {} "$OUT/luci/" \;
           find bin/packages -type f -name "luci-i18n-passwall2-zh-cn_*.ipk" -exec cp -f {} "$OUT/luci/" \;
 
-          # deps ipk（排除 v2ray-geoip/geosite）
           while IFS= read -r p; do
             [ -z "$p" ] && continue
             find bin/packages -type f -name "${p}_*.ipk" \
@@ -169,6 +165,7 @@ jobs:
           name: "IPK (a53) for passwall2 ${{ steps.rel.outputs.tag }}"
           body: |
             Base: ImmortalWrt v21.02.7
+            Target: mediatek/mt7622 (aarch64_cortex-a53)
             passwall2 tag: ${{ steps.rel.outputs.tag }}
             Excluded: v2ray-geoip, v2ray-geosite
             Optional: simple-obfs-server (may be missing)
