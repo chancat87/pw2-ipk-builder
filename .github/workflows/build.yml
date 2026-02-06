@@ -87,11 +87,25 @@ jobs:
         shell: bash
         run: |
           set -e
+          set -x
           cd openwrt
-          test -d package/feeds/passwall2/luci-app-passwall2
-          test -d package/feeds/luci/luci-i18n-passwall2-zh-cn
+
+          if [ ! -d package/feeds/passwall2/luci-app-passwall2 ]; then
+            echo "Missing: luci-app-passwall2" >&2
+            find package/feeds -maxdepth 4 -type d -name 'luci-app-passwall2' -print || true
+            exit 1
+          fi
+
+          I18N_DIR="$(find package/feeds -maxdepth 5 -type d -name 'luci-i18n-passwall2-zh-cn' | head -n 1 || true)"
+          if [ -z "$I18N_DIR" ]; then
+            echo "Missing: luci-i18n-passwall2-zh-cn" >&2
+            echo "Found luci-i18n-passwall2*:" >&2
+            find package/feeds -maxdepth 6 -type d -name 'luci-i18n-passwall2*' -print || true
+            exit 1
+          fi
+
           make package/feeds/passwall2/luci-app-passwall2/compile -j"$(nproc)" V=s
-          make package/feeds/luci/luci-i18n-passwall2-zh-cn/compile -j"$(nproc)" V=s
+          make "${I18N_DIR}/compile" -j"$(nproc)" V=s
 
       - name: pack
         shell: bash
