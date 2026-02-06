@@ -89,6 +89,7 @@ jobs:
           echo "CONFIG_PACKAGE_luci-app-passwall2=m" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-passwall2-zh-cn=m" >> .config
 
+          # 依赖包清单：每行一个“包名”
           while IFS= read -r p; do
             [ -z "$p" ] && continue
             echo "CONFIG_PACKAGE_${p}=m" >> .config
@@ -96,28 +97,63 @@ jobs:
 
           make defconfig
 
-      - name: Build luci packages
+      - name: Build luci packages (must exist)
         run: |
           set -e
           cd openwrt
+
+          test -d package/feeds/passwall2/luci-app-passwall2 || {
+            echo "Missing: package/feeds/passwall2/luci-app-passwall2" >&2
+            exit 1
+          }
+          test -d package/feeds/luci/luci-i18n-passwall2-zh-cn || {
+            echo "Missing: package/feeds/luci/luci-i18n-passwall2-zh-cn" >&2
+            echo "This means your base/feeds do not provide that i18n package." >&2
+            exit 1
+          }
 
           make package/feeds/passwall2/luci-app-passwall2/compile -j"$(nproc)" V=s
           make package/feeds/luci/luci-i18n-passwall2-zh-cn/compile -j"$(nproc)" V=s
 
-      - name: Build dependency packages (simple-obfs-server optional)
+      - name: Build dependency packages by resolving directory from Package: name
         run: |
           set -e
           cd openwrt
 
+          FEEDROOT="package/feeds/passwall_packages"
+          test -d "$FEEDROOT" || { echo "Missing feed root: $FEEDROOT" >&2; exit 1; }
+
+          resolve_dir() {
+            # 返回声明了 "Package: <name>" 的 Makefile 所在目录
+            local name="$1"
+            local mk
+            mk="$(grep -R --line-number --fixed-string "Package: $name" "$FEEDROOT" 2>/dev/null | head -n 1 | cut -d: -f1 || true)"
+            [ -n "$mk" ] || return 1
+            dirname "$mk"
+          }
+
           while IFS= read -r p; do
             [ -z "$p" ] && continue
 
+            # 可选：simple-obfs-server 若你允许失败不断流，保留 true；否则删掉 || true
             if [ "$p" = "simple-obfs-server" ]; then
-              make package/feeds/passwall_packages/simple-obfs/compile -j"$(nproc)" V=s || true
+              DIR="$(resolve_dir "$p" || true)"
+              if [ -n "$DIR" ]; then
+                echo "build optional: $p -> $DIR"
+                make "$DIR/compile" -j"$(nproc)" V=s || true
+              else
+                echo "optional package not found in feed: $p"
+              fi
               continue
             fi
 
-            make "package/feeds/passwall_packages/${p}/compile" -j"$(nproc)" V=s
+            DIR="$(resolve_dir "$p")" || {
+              echo "Cannot find package in passwall_packages feed: $p" >&2
+              exit 1
+            }
+
+            echo "build: $p -> $DIR"
+            make "$DIR/compile" -j"$(nproc)" V=s
           done < ../packages.txt
 
       - name: Collect IPKs and create zip
@@ -130,6 +166,7 @@ jobs:
           find bin/packages -type f -name "luci-app-passwall2_*.ipk" -exec cp -f {} "$OUT/luci/" \;
           find bin/packages -type f -name "luci-i18n-passwall2-zh-cn_*.ipk" -exec cp -f {} "$OUT/luci/" \;
 
+          # deps：按包名抓对应 ipk（包名就是 ipk 文件名前缀）
           while IFS= read -r p; do
             [ -z "$p" ] && continue
             find bin/packages -type f -name "${p}_*.ipk" \
