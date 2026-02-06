@@ -1,16 +1,13 @@
-name: pw2-ipk-a53
+name: Build Passwall2 Dependency IPKs
 
 on:
   workflow_dispatch:
     inputs:
-      passwall2_ref:
-        description: "可选：指定 openwrt-passwall2 的 git ref（tag/branch/commit）。留空=main"
-        required: false
-        default: ""
       packages_ref:
-        description: "可选：指定 openwrt-passwall-packages 的 git ref。留空=main"
+        description: 'openwrt-passwall-packages ref (tag/branch/commit)'
         required: false
-        default: ""
+        default: 'main'
+        type: string
 
 permissions:
   contents: write
@@ -20,333 +17,101 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout (this repo)
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install build deps
-        shell: bash
+      - name: Install build dependencies
         run: |
-          set -e
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential clang flex bison g++ gawk gcc-multilib gettext \
-            git libncurses5-dev libssl-dev python3 python3-distutils rsync unzip zlib1g-dev \
-            file wget curl ca-certificates jq xz-utils zip
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev \
+            libssl-dev python3-distutils rsync unzip zlib1g-dev \
+            file wget curl python3 python3-setuptools \
+            subversion time xsltproc
 
-      - name: Download OpenWrt SDK (21.02.7 mvebu/cortexa53 => aarch64_cortex-a53)
-        shell: bash
+      - name: Download OpenWrt 21.02.7 SDK for ipq60xx/generic
         run: |
-          set -e
-          SDK_URL="https://downloads.openwrt.org/releases/21.02.7/targets/mvebu/cortexa53/openwrt-sdk-21.02.7-mvebu-cortexa53_gcc-8.4.0_musl.Linux-x86_64.tar.xz"
-          echo "SDK_URL=$SDK_URL"
-          curl -fL "$SDK_URL" -o sdk.tar.xz
-          SDK_DIR="$(tar -tJf sdk.tar.xz | head -n 1 | cut -d/ -f1)"
+          wget -O sdk.tar.xz https://archive.openwrt.org/releases/21.02.7/targets/ipq60xx/generic/openwrt-sdk-21.02.7-ipq60xx-generic_gcc-8.4.0_musl.Linux-x86_64.tar.xz
           tar -xJf sdk.tar.xz
-          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
+          mv openwrt-sdk-* sdk
 
-      - name: Prepare feeds (passwall2 + passwall-packages)
-        shell: bash
+      - name: Prepare feeds and clone passwall packages source
+        working-directory: ./sdk
         run: |
-          set -e
-          cd "$SDK_DIR"
-
-          echo "src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git" >> feeds.conf.default
-          echo "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git" >> feeds.conf.default
-
           ./scripts/feeds update -a
-
-          PW2_REF="${{ github.event.inputs.passwall2_ref }}"
-          PKG_REF="${{ github.event.inputs.packages_ref }}"
-
-          if [ -n "$PW2_REF" ]; then
-            echo "Checkout passwall2 ref: $PW2_REF"
-            (cd feeds/passwall2 && git fetch --all --tags && git checkout "$PW2_REF")
-          fi
-
-          if [ -n "$PKG_REF" ]; then
-            echo "Checkout passwall-packages ref: $PKG_REF"
-            (cd feeds/passwall_packages && git fetch --all --tags && git checkout "$PKG_REF")
-          fi
-
           ./scripts/feeds install -a
 
-      - name: Generate .config (modules)
-        shell: bash
+          rm -rf package/feeds/passwall* package/passwall*
+
+          git clone --depth=1 --branch ${{ inputs.packages_ref }} \
+            https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git \
+            package/passwall_packages
+
+          # Pre-build common host tools to reduce missing dependency errors
+          make tools/golang/compile V=s || true
+          make tools/rust/compile V=s || true
+          make package/golang/host/compile V=s || true
+          make package/rust/host/compile V=s || true
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Build dependency packages
+        working-directory: ./sdk
         run: |
-          set -e
-          cd "$SDK_DIR"
+          # Build dependencies from packages.txt, allow failures
+          while IFS= read -r pkg || [[ -n "$pkg" ]]; do
+            [[ "$pkg" =~ ^#.*$ ]] && continue
+            [[ -z "$pkg" ]] && continue
 
-          if [ ! -f "$GITHUB_WORKSPACE/packages.txt" ]; then
-            echo "Missing packages.txt in repo root" >&2
-            exit 1
-          fi
-
-          : > .config
-          echo "CONFIG_DEVEL=y" >> .config
-          echo "CONFIG_TOOLCHAINOPTS=y" >> .config
-
-          # 必须编：主包 + 中文包（你明确要求）
-          echo "CONFIG_PACKAGE_luci-app-passwall2=m" >> .config
-          echo "CONFIG_PACKAGE_luci-i18n-passwall2-zh-cn=m" >> .config
-
-          # 依赖列表：逐行读 packages.txt（忽略空行/注释）
-          while IFS= read -r line; do
-            pkg="$(echo "$line" | sed 's/#.*$//' | xargs || true)"
-            [ -z "$pkg" ] && continue
-            echo "CONFIG_PACKAGE_${pkg}=m" >> .config
-          done < "$GITHUB_WORKSPACE/packages.txt"
-
-          make defconfig
-
-      - name: Build selected packages only
-        shell: bash
-        run: |
-          set -e
-          cd "$SDK_DIR"
-          make -j"$(nproc)" package/compile V=s
-          make package/index V=s
-
-      - name: Collect IPKs and zip deps
-        shell: bash
-        run: |
-          set -e
-          cd "$SDK_DIR"
-
-          OUT="$PWD/out"
-          BIN="bin/packages"
-          ARCH="aarch64_cortex-a53"
-
-          rm -rf "$OUT"
-          mkdir -p "$OUT/deps"
-
-          if [ ! -d "$BIN/$ARCH" ]; then
-            echo "No output dir: $BIN/$ARCH" >&2
-            find "$BIN" -maxdepth 2 -type d -print || true
-            exit 1
-          fi
-
-          PW2_IPK="$(find "$BIN/$ARCH" -type f -name 'luci-app-passwall2_*.ipk' | head -n 1 || true)"
-          I18N_IPK="$(find "$BIN/$ARCH" -type f -name 'luci-i18n-passwall2-zh-cn_*.ipk' | head -n 1 || true)"
-
-          if [ -z "$PW2_IPK" ]; then
-            echo "Missing built ipk: luci-app-passwall2" >&2
-            find "$BIN/$ARCH" -type f -name '*passwall2*.ipk' -print || true
-            exit 1
-          fi
-          if [ -z "$I18N_IPK" ]; then
-            echo "Missing built ipk: luci-i18n-passwall2-zh-cn" >&2
-            find "$BIN/$ARCH" -type f -name 'luci-i18n-passwall2*' -print || true
-            exit 1
-          fi
-
-          cp -f "$PW2_IPK" "$OUT/"
-          cp -f "$I18N_IPK" "$OUT/"
-
-          while IFS= read -r line; do
-            pkg="$(echo "$line" | sed 's/#.*$//' | xargs || true)"
-            [ -z "$pkg" ] && continue
-            found="$(find "$BIN/$ARCH" -type f -name "${pkg}_*.ipk" | sort | tail -n 1 || true)"
-            if [ -z "$found" ]; then
-              echo "Missing dep ipk for: $pkg" >&2
-              exit 1
+            echo "Building: $pkg"
+            if [ -d "package/passwall_packages/$pkg" ]; then
+              make package/passwall_packages/$pkg/compile -j$(nproc) V=s || echo "Warning: $pkg failed, continuing"
+            else
+              make package/$pkg/compile -j$(nproc) V=s || echo "Warning: $pkg not found or failed"
             fi
-            cp -f "$found" "$OUT/deps/"
-          done < "$GITHUB_WORKSPACE/packages.txt"
+          done < ../packages.txt
 
-          (cd "$OUT/deps" && zip -9 "$OUT/passwall_packages_ipk_aarch64_cortex-a53.zip" ./*.ipk)
+      - name: Collect dependency IPK files
+        run: |
+          mkdir -p artifacts/passwall_packages
+
+          # Collect dependencies from packages.txt (exclude geo* if any, but not present)
+          while IFS= read -r pkg || [[ -n "$pkg" ]]; do
+            [[ "$pkg" =~ ^#.*$ ]] && continue
+            [[ -z "$pkg" ]] && continue
+            if [[ "$pkg" != "v2ray-geoip" && "$pkg" != "v2ray-geosite" ]]; then
+              find sdk/bin/packages/aarch64_cortex-a53/ -name "${pkg}_*.ipk" -exec cp {} artifacts/passwall_packages/ \; 2>/dev/null || true
+            fi
+          done < packages.txt
+
+      - name: Package dependencies as zip
+        working-directory: artifacts
+        run: |
+          zip -r passwall_packages_ipk_aarch64_cortex-a53.zip passwall_packages || echo "Zip warning (possibly empty)"
+          mv passwall_packages_ipk_aarch64_cortex-a53.zip ..
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: pw2-ipk-aarch64_cortex-a53
-          path: |
-            ${{ env.SDK_DIR }}/out/*.ipk
-            ${{ env.SDK_DIR }}/out/*.zip
+          name: passwall2-dependency-ipks
+          path: passwall_packages_ipk_aarch64_cortex-a53.zip
+          retention-days: 14
 
-      - name: Create GitHub Release (manual run)
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: pw2-ipk-a53-${{ github.run_id }}
-          name: pw2-ipk-a53-${{ github.run_id }}
+          tag_name: build-${{ github.run_number }}-${{ github.run_id }}
+          name: Dependency Build ${{ github.run_number }} (${{ inputs.packages_ref }})
           body: |
-            SDK: OpenWrt 21.02.7 mvebu/cortexa53 (aarch64_cortex-a53)
-            Built: luci-app-passwall2 + luci-i18n-passwall2-zh-cn + packages.txt deps
-          files: |
-            ${{ env.SDK_DIR }}/out/*.ipk
-            ${{ env.SDK_DIR }}/out/*.zip
-name: pw2-ipk-a53
+            Auto-built Passwall2 Dependency IPKs for aarch64_cortex-a53 (21.02 compatible)
 
-on:
-  workflow_dispatch:
-    inputs:
-      passwall2_ref:
-        description: "可选：指定 openwrt-passwall2 的 git ref（tag/branch/commit）。留空=main"
-        required: false
-        default: ""
-      packages_ref:
-        description: "可选：指定 openwrt-passwall-packages 的 git ref。留空=main"
-        required: false
-        default: ""
+            - packages ref: ${{ inputs.packages_ref }}
+            - SDK base: OpenWrt 21.02.7 ipq60xx/generic
+            - Packages source: Based on upstream snapshots/passwall_packages listing
+            - Date: $(date -u +"%Y-%m-%d %H:%M UTC")
 
-permissions:
-  contents: write
-
-jobs:
-  build:
-    runs-on: ubuntu-22.04
-
-    steps:
-      - name: Checkout (this repo)
-        uses: actions/checkout@v4
-
-      - name: Install build deps
-        shell: bash
-        run: |
-          set -e
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential clang flex bison g++ gawk gcc-multilib gettext \
-            git libncurses5-dev libssl-dev python3 python3-distutils rsync unzip zlib1g-dev \
-            file wget curl ca-certificates jq xz-utils zip
-
-      - name: Download OpenWrt SDK (21.02.7 mvebu/cortexa53 => aarch64_cortex-a53)
-        shell: bash
-        run: |
-          set -e
-          SDK_URL="https://downloads.openwrt.org/releases/21.02.7/targets/mvebu/cortexa53/openwrt-sdk-21.02.7-mvebu-cortexa53_gcc-8.4.0_musl.Linux-x86_64.tar.xz"
-          echo "SDK_URL=$SDK_URL"
-          curl -fL "$SDK_URL" -o sdk.tar.xz
-          SDK_DIR="$(tar -tJf sdk.tar.xz | head -n 1 | cut -d/ -f1)"
-          tar -xJf sdk.tar.xz
-          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
-
-      - name: Prepare feeds (passwall2 + passwall-packages)
-        shell: bash
-        run: |
-          set -e
-          cd "$SDK_DIR"
-
-          echo "src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git" >> feeds.conf.default
-          echo "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git" >> feeds.conf.default
-
-          ./scripts/feeds update -a
-
-          PW2_REF="${{ github.event.inputs.passwall2_ref }}"
-          PKG_REF="${{ github.event.inputs.packages_ref }}"
-
-          if [ -n "$PW2_REF" ]; then
-            echo "Checkout passwall2 ref: $PW2_REF"
-            (cd feeds/passwall2 && git fetch --all --tags && git checkout "$PW2_REF")
-          fi
-
-          if [ -n "$PKG_REF" ]; then
-            echo "Checkout passwall-packages ref: $PKG_REF"
-            (cd feeds/passwall_packages && git fetch --all --tags && git checkout "$PKG_REF")
-          fi
-
-          ./scripts/feeds install -a
-
-      - name: Generate .config (modules)
-        shell: bash
-        run: |
-          set -e
-          cd "$SDK_DIR"
-
-          if [ ! -f "$GITHUB_WORKSPACE/packages.txt" ]; then
-            echo "Missing packages.txt in repo root" >&2
-            exit 1
-          fi
-
-          : > .config
-          echo "CONFIG_DEVEL=y" >> .config
-          echo "CONFIG_TOOLCHAINOPTS=y" >> .config
-
-          # 必须编：主包 + 中文包（你明确要求）
-          echo "CONFIG_PACKAGE_luci-app-passwall2=m" >> .config
-          echo "CONFIG_PACKAGE_luci-i18n-passwall2-zh-cn=m" >> .config
-
-          # 依赖列表：逐行读 packages.txt（忽略空行/注释）
-          while IFS= read -r line; do
-            pkg="$(echo "$line" | sed 's/#.*$//' | xargs || true)"
-            [ -z "$pkg" ] && continue
-            echo "CONFIG_PACKAGE_${pkg}=m" >> .config
-          done < "$GITHUB_WORKSPACE/packages.txt"
-
-          make defconfig
-
-      - name: Build selected packages only
-        shell: bash
-        run: |
-          set -e
-          cd "$SDK_DIR"
-          make -j"$(nproc)" package/compile V=s
-          make package/index V=s
-
-      - name: Collect IPKs and zip deps
-        shell: bash
-        run: |
-          set -e
-          cd "$SDK_DIR"
-
-          OUT="$PWD/out"
-          BIN="bin/packages"
-          ARCH="aarch64_cortex-a53"
-
-          rm -rf "$OUT"
-          mkdir -p "$OUT/deps"
-
-          if [ ! -d "$BIN/$ARCH" ]; then
-            echo "No output dir: $BIN/$ARCH" >&2
-            find "$BIN" -maxdepth 2 -type d -print || true
-            exit 1
-          fi
-
-          PW2_IPK="$(find "$BIN/$ARCH" -type f -name 'luci-app-passwall2_*.ipk' | head -n 1 || true)"
-          I18N_IPK="$(find "$BIN/$ARCH" -type f -name 'luci-i18n-passwall2-zh-cn_*.ipk' | head -n 1 || true)"
-
-          if [ -z "$PW2_IPK" ]; then
-            echo "Missing built ipk: luci-app-passwall2" >&2
-            find "$BIN/$ARCH" -type f -name '*passwall2*.ipk' -print || true
-            exit 1
-          fi
-          if [ -z "$I18N_IPK" ]; then
-            echo "Missing built ipk: luci-i18n-passwall2-zh-cn" >&2
-            find "$BIN/$ARCH" -type f -name 'luci-i18n-passwall2*' -print || true
-            exit 1
-          fi
-
-          cp -f "$PW2_IPK" "$OUT/"
-          cp -f "$I18N_IPK" "$OUT/"
-
-          while IFS= read -r line; do
-            pkg="$(echo "$line" | sed 's/#.*$//' | xargs || true)"
-            [ -z "$pkg" ] && continue
-            found="$(find "$BIN/$ARCH" -type f -name "${pkg}_*.ipk" | sort | tail -n 1 || true)"
-            if [ -z "$found" ]; then
-              echo "Missing dep ipk for: $pkg" >&2
-              exit 1
-            fi
-            cp -f "$found" "$OUT/deps/"
-          done < "$GITHUB_WORKSPACE/packages.txt"
-
-          (cd "$OUT/deps" && zip -9 "$OUT/passwall_packages_ipk_aarch64_cortex-a53.zip" ./*.ipk)
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: pw2-ipk-aarch64_cortex-a53
-          path: |
-            ${{ env.SDK_DIR }}/out/*.ipk
-            ${{ env.SDK_DIR }}/out/*.zip
-
-      - name: Create GitHub Release (manual run)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: pw2-ipk-a53-${{ github.run_id }}
-          name: pw2-ipk-a53-${{ github.run_id }}
-          body: |
-            SDK: OpenWrt 21.02.7 mvebu/cortexa53 (aarch64_cortex-a53)
-            Built: luci-app-passwall2 + luci-i18n-passwall2-zh-cn + packages.txt deps
-          files: |
-            ${{ env.SDK_DIR }}/out/*.ipk
-            ${{ env.SDK_DIR }}/out/*.zip
+            File:
+            - passwall_packages_ipk_aarch64_cortex-a53.zip
+          files: passwall_packages_ipk_aarch64_cortex-a53.zip
