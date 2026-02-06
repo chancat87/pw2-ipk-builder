@@ -39,9 +39,18 @@ jobs:
           set -e
           SDK_URL="https://downloads.openwrt.org/releases/21.02.7/targets/mvebu/cortexa53/openwrt-sdk-21.02.7-mvebu-cortexa53_gcc-8.4.0_musl.Linux-x86_64.tar.xz"
           echo "SDK_URL=$SDK_URL"
+
           curl -fL "$SDK_URL" -o sdk.tar.xz
           tar -xJf sdk.tar.xz
-          SDK_DIR="$(tar -tJf sdk.tar.xz | head -n 1 | cut -d/ -f1)"
+
+          # 避免 tar -t | head 在 pipefail 环境触发 broken pipe
+          SDK_DIR="$(find . -maxdepth 1 -type d -name 'openwrt-sdk-21.02.7-*' -print -quit | sed 's|^\./||')"
+          if [ -z "$SDK_DIR" ]; then
+            echo "SDK_DIR not found after extract" >&2
+            ls -la
+            exit 1
+          fi
+
           echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
 
       - name: Prepare feeds (passwall2 + passwall-packages)
@@ -50,14 +59,11 @@ jobs:
           set -e
           cd "$SDK_DIR"
 
-          # 追加 feeds
-          # 注意：SDK 自带 packages/luci/routing/telephony；这里只新增 passwall2 + passwall_packages
           {
             echo "src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git"
             echo "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git"
           } >> feeds.conf.default
 
-          # 可选：切 ref（不强制）
           PW2_REF="${{ github.event.inputs.passwall2_ref }}"
           PKG_REF="${{ github.event.inputs.packages_ref }}"
 
@@ -90,11 +96,11 @@ jobs:
 
           # 基础配置
           cat > .config <<'EOF'
-          CONFIG_DEVEL=y
-          CONFIG_TOOLCHAINOPTS=y
-          EOF
+CONFIG_DEVEL=y
+CONFIG_TOOLCHAINOPTS=y
+EOF
 
-          # 固定把 passwall2 插件和中文包加入编译目标（你明确要求必须有）
+          # 固定编译 passwall2 插件与中文包
           echo "CONFIG_PACKAGE_luci-app-passwall2=m" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-passwall2-zh-cn=m" >> .config
 
@@ -107,14 +113,14 @@ jobs:
 
           make defconfig
 
-          # 校验：至少必须在 feeds 里存在 passwall2 的 luci-app-passwall2
+          # 预检：passwall2 主包必须存在
           if ! find package/feeds -maxdepth 4 -type d -name 'luci-app-passwall2' | grep -q .; then
             echo "Missing source dir: luci-app-passwall2 (feeds not installed?)" >&2
             find package/feeds -maxdepth 4 -type d -name '*passwall2*' -print || true
             exit 1
           fi
 
-          # 校验：中文包必须存在（否则你会白等 1 小时最后失败）
+          # 预检：中文包必须存在（避免白等很久才失败）
           if ! find package/feeds -maxdepth 6 -type d -name 'luci-i18n-passwall2-zh-cn' | grep -q .; then
             echo "Missing source dir: luci-i18n-passwall2-zh-cn" >&2
             echo "Found luci-i18n-passwall2*:" >&2
@@ -128,7 +134,6 @@ jobs:
           set -e
           cd "$SDK_DIR"
 
-          # 只编译选中的包（由 .config 控制），不会去编译固件
           make -j"$(nproc)" package/compile V=s
           make package/index V=s
 
@@ -138,7 +143,6 @@ jobs:
           set -e
           cd "$SDK_DIR"
 
-          # SDK 输出目录一般在 bin/packages/<arch>/<feed>/*.ipk
           BIN="bin/packages"
           ARCH="aarch64_cortex-a53"
 
@@ -148,7 +152,6 @@ jobs:
             exit 1
           fi
 
-          # 取出 luci-app-passwall2 与中文包
           PW2_IPK="$(find "$BIN/$ARCH" -type f -name 'luci-app-passwall2_*.ipk' | head -n 1 || true)"
           I18N_IPK="$(find "$BIN/$ARCH" -type f -name 'luci-i18n-passwall2-zh-cn_*.ipk' | head -n 1 || true)"
 
@@ -157,6 +160,7 @@ jobs:
             find "$BIN/$ARCH" -type f -name '*passwall2*.ipk' -print || true
             exit 1
           fi
+
           if [ -z "$I18N_IPK" ]; then
             echo "Missing built ipk: luci-i18n-passwall2-zh-cn" >&2
             find "$BIN/$ARCH" -type f -name 'luci-i18n-passwall2*' -print || true
@@ -166,12 +170,12 @@ jobs:
           cp -f "$PW2_IPK" out/
           cp -f "$I18N_IPK" out/
 
-          # 依赖包：按 packages.txt 的包名匹配 ipk 文件名（前缀匹配）
           mkdir -p out/deps
+
           while IFS= read -r line; do
             pkg="$(echo "$line" | sed 's/#.*$//' | xargs || true)"
             [ -z "$pkg" ] && continue
-            # 常见 ipk 文件名：<pkg>_<ver>_<arch>.ipk
+
             found="$(find "$BIN/$ARCH" -type f -name "${pkg}_*.ipk" | sort | tail -n 1 || true)"
             if [ -z "$found" ]; then
               echo "Missing dep ipk for: $pkg" >&2
@@ -199,7 +203,6 @@ jobs:
           set -e
           cd "$SDK_DIR"
 
-          # 生成一个不会冲突的 tag（你手动点跑一次就发一次）
           TS="$(date -u +%Y%m%d-%H%M%S)"
           TAG="pw2-ipk-a53-${TS}"
 
