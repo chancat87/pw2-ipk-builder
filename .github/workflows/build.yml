@@ -30,11 +30,14 @@ jobs:
             file wget curl python3 python3-setuptools \
             subversion time xsltproc
 
-      - name: Download OpenWrt 21.02.7 SDK for ipq60xx/generic
+      - name: Download GL.iNet SDK for ipq807x-2102 (compatible with ipq60xx)
         run: |
-          wget -O sdk.tar.xz https://archive.openwrt.org/releases/21.02.7/targets/ipq60xx/generic/openwrt-sdk-21.02.7-ipq60xx-generic_gcc-8.4.0_musl.Linux-x86_64.tar.xz
-          tar -xJf sdk.tar.xz
-          mv openwrt-sdk-* sdk
+          git clone https://github.com/gl-inet/sdk.git
+          cd sdk
+          ./download.sh ipq807x-2102
+          tar -xJf openwrt-sdk-ipq807x-2102.tar.xz
+          mv openwrt-sdk-ipq807x-2102 ../sdk
+          cd ..
 
       - name: Prepare feeds and clone passwall packages source
         working-directory: ./sdk
@@ -108,7 +111,7 @@ jobs:
             Auto-built Passwall2 Dependency IPKs for aarch64_cortex-a53 (21.02 compatible)
 
             - packages ref: ${{ inputs.packages_ref }}
-            - SDK base: OpenWrt 21.02.7 ipq60xx/generic
+            - SDK base: GL.iNet ipq807x-2102 (OpenWrt 21.02)
             - Packages source: Based on upstream snapshots/passwall_packages listing
             - Date: $(date -u +"%Y-%m-%d %H:%M UTC")
 
