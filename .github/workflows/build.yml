@@ -38,10 +38,7 @@ jobs:
             exit 0
           fi
           TAG="$(curl -fsSL https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall2/releases/latest | jq -r .tag_name)"
-          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-            echo "Failed to fetch latest tag" >&2
-            exit 1
-          fi
+          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "Failed to fetch latest tag" >&2; exit 1; }
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Clone ImmortalWrt buildroot v21.02.7
@@ -49,7 +46,7 @@ jobs:
           set -e
           git clone --depth 1 --branch v21.02.7 https://github.com/immortalwrt/immortalwrt.git openwrt
 
-      - name: Add feeds and pin passwall2 to tag
+      - name: Add feeds, update all, pin passwall2 to tag
         run: |
           set -e
           cd openwrt
@@ -59,10 +56,8 @@ jobs:
             "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git;main" \
             >> feeds.conf.default
 
-          ./scripts/feeds update passwall2
-          ./scripts/feeds update passwall_packages
-          ./scripts/feeds install -a -p passwall2
-          ./scripts/feeds install -a -p passwall_packages
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
 
           cd feeds/passwall2
           git fetch --tags --force
@@ -72,24 +67,18 @@ jobs:
         run: |
           set -e
           cd openwrt
-
           : > .config
           printf '%s\n' \
             "CONFIG_TARGET_mediatek=y" \
             "CONFIG_TARGET_mediatek_mt7622=y" \
             >> .config
-
           make defconfig
 
-          echo "==> Selected targets (sanity):"
-          grep -E '^CONFIG_TARGET_' .config | head -n 50 || true
-
-      - name: Prepare build tools & toolchain (avoid race)
+      - name: Prepare build tools & toolchain (stable order)
         run: |
           set -e
           cd openwrt
           make tools/install -j"$(nproc)" V=s
-          # toolchain 这里用 -j1 更稳，避免 staging 内文件缺失导致 libc 打包失败
           make toolchain/install -j1 V=s
 
       - name: Append package selections
@@ -107,18 +96,13 @@ jobs:
 
           make defconfig
 
-      - name: Build luci packages (print last 200 lines on failure)
+      - name: Build luci packages
         run: |
           set -e
           cd openwrt
 
-          make package/feeds/passwall2/luci-app-passwall2/compile -j"$(nproc)" V=s 2>&1 | tee /tmp/pw2_luci.log || {
-            echo "==== luci build failed, last 200 lines ===="
-            tail -n 200 /tmp/pw2_luci.log
-            exit 1
-          }
-
-          make package/feeds/passwall2/luci-i18n-passwall2-zh-cn/compile -j"$(nproc)" V=s
+          make package/feeds/passwall2/luci-app-passwall2/compile -j"$(nproc)" V=s
+          make package/feeds/luci/luci-i18n-passwall2-zh-cn/compile -j"$(nproc)" V=s
 
       - name: Build dependency packages (simple-obfs-server optional)
         run: |
@@ -129,12 +113,10 @@ jobs:
             [ -z "$p" ] && continue
 
             if [ "$p" = "simple-obfs-server" ]; then
-              echo "optional: $p"
               make package/feeds/passwall_packages/simple-obfs/compile -j"$(nproc)" V=s || true
               continue
             fi
 
-            echo "build: $p"
             make "package/feeds/passwall_packages/${p}/compile" -j"$(nproc)" V=s
           done < ../packages.txt
 
