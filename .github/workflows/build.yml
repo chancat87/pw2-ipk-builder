@@ -65,13 +65,14 @@ jobs:
         working-directory: lede
         run: |
           make clean || true
-          # 强制设置 ipq60xx/generic target
-          echo "CONFIG_TARGET_ipq60xx=y" > .config
-          echo "CONFIG_TARGET_ipq60xx_generic=y" >> .config
-          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=512" >> .config  # 避免分区问题
+          rm -f .config
+          cat <<EOF >> .config
+          CONFIG_TARGET_ipq60xx=y
+          CONFIG_TARGET_ipq60xx_generic=y
+          CONFIG_TARGET_ROOTFS_PARTSIZE=512
+          EOF
           make defconfig
-          # 调试：输出当前 target 配置
-          grep CONFIG_TARGET .config
+          grep CONFIG_TARGET .config || echo "No target config found"
 
       - name: Pre-build host tools
         working-directory: lede
@@ -84,7 +85,6 @@ jobs:
       - name: Build dependency packages
         working-directory: lede
         run: |
-          # 调试：显示 bin/packages 目录结构
           ls -la bin/packages || echo "bin/packages not exist yet"
           while IFS= read -r pkg || [[ -n "$pkg" ]]; do
             [[ "\( pkg" =~ ^#.* \) ]] && continue
