@@ -1,4 +1,4 @@
-name: Build Passwall2 Dependency IPKs (Official OpenWrt SDK)
+name: Build Passwall2 Dependency IPKs
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-20.04  # 切换到 ubuntu-20.04 以匹配网友建议的构建环境
 
     steps:
       - name: Checkout repository
@@ -28,13 +28,26 @@ jobs:
             gcc-multilib g++-multilib gettext git libncurses-dev \
             libssl-dev python3-distutils rsync unzip zlib1g-dev \
             file wget curl python3 python3-setuptools \
-            subversion time xsltproc
+            subversion time xsltproc libelf-dev  # 添加 libelf-dev 以兼容旧构建
 
-      - name: Download Official OpenWrt 21.02.7 SDK (aarch64_generic, musl)
+      - name: Download ImmortalWrt 21.02-SNAPSHOT SDK for ipq60xx/generic
         run: |
-          wget -O sdk.tar.xz https://downloads.openwrt.org/releases/21.02.7/targets/aarch64_generic/openwrt-sdk-21.02.7-aarch64_generic_gcc-8.4.0_musl.Linux-x86_64.tar.xz
+          # 尝试主链接
+          wget -O sdk.tar.xz https://downloads.immortalwrt.org/releases/21.02-SNAPSHOT/targets/ipq60xx/generic/immortalwrt-sdk-21.02-SNAPSHOT-ipq60xx-generic_gcc-8.4.0_musl.Linux-x86_64.tar.xz || true
+          
+          # 如果失败，尝试镜像链接1 (基于第三方存档)
+          if [ ! -f sdk.tar.xz ]; then
+            wget -O sdk.tar.xz https://mirror.ps.kz/openwrt/releases/packages-21.02/aarch64_cortex-a53/immortalwrt-sdk-21.02-SNAPSHOT-ipq60xx-generic_gcc-8.4.0_musl.Linux-x86_64.tar.xz || true
+          fi
+          
+          # 如果仍失败，尝试镜像链接2 (如果有其他)
+          if [ ! -f sdk.tar.xz ]; then
+            echo "All SDK download attempts failed. Consider manual upload or source build."
+            exit 1
+          fi
+          
           tar -xJf sdk.tar.xz
-          mv openwrt-sdk-* sdk
+          mv immortalwrt-sdk-* sdk
 
       - name: Prepare feeds and clone passwall packages source
         working-directory: ./sdk
@@ -48,7 +61,7 @@ jobs:
             https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git \
             package/passwall_packages
 
-          # Pre-compile host tools for common dependencies (golang/rust often needed)
+          # Pre-build common host tools to reduce missing dependency errors
           make tools/golang/compile V=s || true
           make tools/rust/compile V=s || true
           make package/golang/host/compile V=s || true
@@ -60,23 +73,24 @@ jobs:
       - name: Build dependency packages
         working-directory: ./sdk
         run: |
-          # Compile each package from packages.txt, continue on failure
+          # Build dependencies from packages.txt, allow failures
           while IFS= read -r pkg || [[ -n "$pkg" ]]; do
             [[ "$pkg" =~ ^#.*$ ]] && continue
             [[ -z "$pkg" ]] && continue
 
-            echo "Building package: $pkg"
+            echo "Building: $pkg"
             if [ -d "package/passwall_packages/$pkg" ]; then
-              make package/passwall_packages/$pkg/compile -j$(nproc) V=s || echo "Warning: $pkg failed to build, continuing..."
+              make package/passwall_packages/$pkg/compile -j$(nproc) V=s || echo "Warning: $pkg failed, continuing"
             else
-              make package/$pkg/compile -j$(nproc) V=s || echo "Warning: $pkg not found or failed, skipping..."
+              make package/$pkg/compile -j$(nproc) V=s || echo "Warning: $pkg not found or failed"
             fi
           done < ../packages.txt
 
-      - name: Collect built IPK files
+      - name: Collect dependency IPK files
         run: |
           mkdir -p artifacts/passwall_packages
 
+          # Collect dependencies from packages.txt (exclude geo* if any, but not present)
           while IFS= read -r pkg || [[ -n "$pkg" ]]; do
             [[ "$pkg" =~ ^#.*$ ]] && continue
             [[ -z "$pkg" ]] && continue
@@ -85,13 +99,13 @@ jobs:
             fi
           done < packages.txt
 
-      - name: Create zip archive
+      - name: Package dependencies as zip
         working-directory: artifacts
         run: |
-          zip -r passwall_packages_ipk_aarch64_cortex-a53.zip passwall_packages || echo "Zip creation warning (possibly empty folder)"
+          zip -r passwall_packages_ipk_aarch64_cortex-a53.zip passwall_packages || echo "Zip warning (possibly empty)"
           mv passwall_packages_ipk_aarch64_cortex-a53.zip ..
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: passwall2-dependency-ipks
@@ -104,14 +118,13 @@ jobs:
           tag_name: build-${{ github.run_number }}-${{ github.run_id }}
           name: Dependency Build ${{ github.run_number }} (${{ inputs.packages_ref }})
           body: |
-            Auto-built Passwall2 dependency IPKs using official OpenWrt 21.02.7 SDK (aarch64_generic, musl)
+            Auto-built Passwall2 Dependency IPKs for aarch64_cortex-a53 (21.02 compatible)
 
             - packages ref: ${{ inputs.packages_ref }}
-            - SDK: Official OpenWrt 21.02.7 aarch64_generic (compatible with aarch64_cortex-a53 devices)
-            - Target: aarch64_cortex-a53
+            - SDK base: ImmortalWrt 21.02-SNAPSHOT ipq60xx/generic
+            - Packages source: Based on upstream snapshots/passwall_packages listing
             - Date: $(date -u +"%Y-%m-%d %H:%M UTC")
-            - Note: Built to match snapshots style from SourceForge project using official SDK toolchain
 
-            Artifact:
+            File:
             - passwall_packages_ipk_aarch64_cortex-a53.zip
           files: passwall_packages_ipk_aarch64_cortex-a53.zip
