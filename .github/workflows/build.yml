@@ -30,14 +30,11 @@ jobs:
             file wget curl python3 python3-setuptools \
             subversion time xsltproc
 
-      - name: Download GL.iNet SDK for ipq807x-2102 (compatible with ipq60xx)
+      - name: Download ImmortalWrt 21.02-SNAPSHOT SDK for ipq60xx/generic
         run: |
-          git clone https://github.com/gl-inet/sdk.git
-          cd sdk
-          ./download.sh ipq807x-2102
-          tar -xJf openwrt-sdk-ipq807x-2102.tar.xz
-          mv openwrt-sdk-ipq807x-2102 ../sdk
-          cd ..
+          wget -O sdk.tar.xz https://downloads.immortalwrt.org/releases/21.02-SNAPSHOT/targets/ipq60xx/generic/immortalwrt-sdk-21.02-SNAPSHOT-ipq60xx-generic_gcc-8.4.0_musl.Linux-x86_64.tar.xz
+          tar -xJf sdk.tar.xz
+          mv immortalwrt-sdk-* sdk
 
       - name: Prepare feeds and clone passwall packages source
         working-directory: ./sdk
@@ -111,7 +108,7 @@ jobs:
             Auto-built Passwall2 Dependency IPKs for aarch64_cortex-a53 (21.02 compatible)
 
             - packages ref: ${{ inputs.packages_ref }}
-            - SDK base: GL.iNet ipq807x-2102 (OpenWrt 21.02)
+            - SDK base: ImmortalWrt 21.02-SNAPSHOT ipq60xx/generic
             - Packages source: Based on upstream snapshots/passwall_packages listing
             - Date: $(date -u +"%Y-%m-%d %H:%M UTC")
 
