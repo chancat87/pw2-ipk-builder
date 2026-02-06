@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       passwall2_tag:
-        description: "Use this openwrt-passwall2 tag. Empty = Latest Release tag."
+        description: "Use openwrt-passwall2 tag. Empty = Latest Release tag."
         required: false
         default: ""
 
@@ -39,7 +39,7 @@ jobs:
           fi
           TAG="$(curl -fsSL https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall2/releases/latest | jq -r .tag_name)"
           if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-            echo "Failed to fetch latest tag" >&2
+            echo "Failed to fetch latest release tag" >&2
             exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -49,11 +49,16 @@ jobs:
           set -e
           git clone --depth 1 --branch v21.02.7 https://github.com/immortalwrt/immortalwrt.git openwrt
 
-      - name: Add feeds and pin passwall2 to tag
+      - name: Update/install default feeds then add passwall feeds and pin tag
         run: |
           set -e
           cd openwrt
 
+          # 1) 必须先拉取/安装默认 feeds（含 luci / packages / routing / telephony 等）
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          # 2) 追加 passwall feeds
           printf '%s\n' \
             "src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git" \
             "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git" \
@@ -64,6 +69,7 @@ jobs:
           ./scripts/feeds install -a -p passwall2
           ./scripts/feeds install -a -p passwall_packages
 
+          # 3) passwall2 feed checkout 到指定 tag（为空时为 Latest）
           cd feeds/passwall2
           git fetch --tags --force
           git checkout -f "${{ steps.rel.outputs.tag }}"
@@ -96,9 +102,11 @@ jobs:
           set -e
           cd openwrt
 
+          # pw2 luci
           echo "CONFIG_PACKAGE_luci-app-passwall2=m" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-passwall2-zh-cn=m" >> .config
 
+          # dependencies whitelist
           while IFS= read -r p; do
             [ -z "$p" ] && continue
             echo "CONFIG_PACKAGE_${p}=m" >> .config
@@ -123,6 +131,7 @@ jobs:
 
             if [ "$p" = "simple-obfs-server" ]; then
               echo "optional: $p"
+              # 目录通常是 simple-obfs
               make package/feeds/passwall_packages/simple-obfs/compile -j"$(nproc)" V=s || true
               continue
             fi
@@ -138,9 +147,11 @@ jobs:
           OUT="$PWD/out"
           mkdir -p "$OUT/deps" "$OUT/luci"
 
+          # luci ipk
           find bin/packages -type f -name "luci-app-passwall2_*.ipk" -exec cp -f {} "$OUT/luci/" \;
           find bin/packages -type f -name "luci-i18n-passwall2-zh-cn_*.ipk" -exec cp -f {} "$OUT/luci/" \;
 
+          # deps ipk（排除 v2ray-geoip/geosite）
           while IFS= read -r p; do
             [ -z "$p" ] && continue
             find bin/packages -type f -name "${p}_*.ipk" \
