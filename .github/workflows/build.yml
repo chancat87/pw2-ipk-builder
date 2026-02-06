@@ -1,4 +1,4 @@
-name: Build Passwall2 Dependency IPKs (OpenWrt 22.03 SDK)
+name: Build Passwall2 Dependency IPKs from Lean lede 22.03 Source
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04  # 强制使用 22.04，确保 python3-distutils 可用，启动快且兼容好
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout repository
@@ -28,73 +28,81 @@ jobs:
             gcc-multilib g++-multilib gettext git libncurses5-dev \
             libssl-dev python3-distutils python3-setuptools \
             rsync unzip zlib1g-dev file wget curl python3 subversion \
-            time xsltproc libelf-dev patch
+            time xsltproc libelf-dev patch gawk unzip bc ccache ecj fastjar \
+            java-propose-classpath libelf1-dev libglib2.0-dev libzstd-dev \
+            python3-distutils-extra python3-pyelftools quilt
 
-      - name: Download OpenWrt 22.03.6 SDK (aarch64_generic)
+      - name: Cache lede source and build artifacts
+        uses: actions/cache@v4
+        id: cache-lede
+        with:
+          path: lede
+          key: lede-openwrt-22.03-ipq60xx-${{ hashFiles('lede/.config', 'lede/feeds.conf.default') }}
+          restore-keys: lede-openwrt-22.03-ipq60xx-
+
+      - name: Clone Lean lede openwrt-22.03 branch
+        if: steps.cache-lede.outputs.cache-hit != 'true'
         run: |
-          # 主下载链接
-          wget -O sdk.tar.xz https://downloads.openwrt.org/releases/22.03.6/targets/aarch64_generic/openwrt-sdk-22.03.6-aarch64_generic_gcc-11.2.0_musl.Linux-x86_64.tar.xz || true
-          
-          # 备用存档链接
-          if [ ! -f sdk.tar.xz ]; then
-            wget -O sdk.tar.xz https://archive.openwrt.org/releases/22.03.6/targets/aarch64_generic/openwrt-sdk-22.03.6-aarch64_generic_gcc-11.2.0_musl.Linux-x86_64.tar.xz || true
-          fi
-          
-          if [ ! -f sdk.tar.xz ]; then
-            echo "Error: Failed to download OpenWrt 22.03.6 SDK from both sources."
-            exit 1
-          fi
-          
-          tar -xJf sdk.tar.xz
-          mv openwrt-sdk-* sdk
+          git clone -b openwrt-22.03 --depth=1 https://github.com/coolsnowwolf/lede.git
+          cd lede
 
-      - name: Prepare feeds and clone passwall packages
-        working-directory: ./sdk
+      - name: Update and install feeds
+        working-directory: lede
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          rm -rf package/feeds/passwall* package/passwall*
-
+      - name: Add passwall_packages feed
+        working-directory: lede
+        run: |
           git clone --depth=1 --branch ${{ inputs.packages_ref }} \
             https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git \
             package/passwall_packages
 
-          # 预编译常见 host 工具，减少后续依赖错误
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure target ipq60xx/generic
+        working-directory: lede
+        run: |
+          # 配置为 ipq60xx/generic target（您的设备）
+          # 这里使用非交互方式设置 target（可根据需要调整）
+          make defconfig || true  # 先默认配置
+          # 强制设置 target（ipq60xx/generic）
+          sed -i 's/CONFIG_TARGET_.*=y/CONFIG_TARGET_ipq60xx=y\nCONFIG_TARGET_ipq60xx_generic=y/' .config
+          make defconfig
+
+      - name: Pre-build host tools (golang, rust, etc.)
+        working-directory: lede
+        run: |
           make tools/install V=s || true
           make package/golang/host/compile V=s || true
           make package/rust/host/compile V=s || true
           make package/boost/compile V=s || true
 
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-
-      - name: Build dependency packages
-        working-directory: ./sdk
+      - name: Build dependency packages from packages.txt
+        working-directory: lede
         run: |
           while IFS= read -r pkg || [[ -n "$pkg" ]]; do
             [[ "$pkg" =~ ^#.*$ ]] && continue
             [[ -z "$pkg" ]] && continue
 
             echo "Building package: $pkg"
-            if [ -d "package/passwall_packages/$pkg" ]; then
-              make package/passwall_packages/$pkg/compile -j$(nproc) V=s || echo "Warning: $pkg failed, continuing..."
-            else
-              make package/$pkg/compile -j$(nproc) V=s || echo "Warning: $pkg not found or failed, skipping..."
-            fi
+            make package/$pkg/compile -j$(nproc) V=s || echo "Warning: $pkg failed, continuing..."
           done < ../packages.txt
 
       - name: Collect built IPK files
         run: |
           mkdir -p artifacts/passwall_packages
+          cd lede/bin/packages/aarch64_cortex-a53
 
           while IFS= read -r pkg || [[ -n "$pkg" ]]; do
             [[ "$pkg" =~ ^#.*$ ]] && continue
             [[ -z "$pkg" ]] && continue
             if [[ "$pkg" != "v2ray-geoip" && "$pkg" != "v2ray-geosite" ]]; then
-              find sdk/bin/packages/aarch64_cortex-a53/ -name "${pkg}_*.ipk" -exec cp {} artifacts/passwall_packages/ \; 2>/dev/null || true
+              find . -name "${pkg}_*.ipk" -exec cp {} ../../../artifacts/passwall_packages/ \; 2>/dev/null || true
             fi
-          done < packages.txt
+          done < ../../packages.txt
 
       - name: Create zip archive
         working-directory: artifacts
@@ -115,11 +123,10 @@ jobs:
           tag_name: build-${{ github.run_number }}-${{ github.run_id }}
           name: Dependency Build ${{ github.run_number }} (${{ inputs.packages_ref }})
           body: |
-            Auto-built Passwall2 dependency IPKs using OpenWrt 22.03.6 SDK
+            Auto-built Passwall2 dependency IPKs from Lean lede openwrt-22.03 source
 
             - packages ref: ${{ inputs.packages_ref }}
-            - SDK: OpenWrt 22.03.6 aarch64_generic (gcc-11.2.0 musl)
-            - Target: aarch64_cortex-a53
+            - Target: ipq60xx/generic (aarch64_cortex-a53)
             - Date: $(date -u +"%Y-%m-%d %H:%M UTC")
 
             Artifact:
