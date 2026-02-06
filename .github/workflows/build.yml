@@ -1,4 +1,4 @@
-name: Build Passwall2 Dependency IPKs from Lean lede 22.03 Source
+name: Build Passwall2 Dependency IPKs from Lean lede master Source
 
 on:
   workflow_dispatch:
@@ -32,18 +32,18 @@ jobs:
             java-propose-classpath libglib2.0-dev libzstd-dev \
             python3-pyelftools quilt
 
-      - name: Cache lede source and build artifacts
+      - name: Cache lede source
         uses: actions/cache@v4
         id: cache-lede
         with:
           path: lede
-          key: lede-openwrt-22.03-ipq60xx-${{ hashFiles('lede/.config', 'lede/feeds.conf.default') }}
-          restore-keys: lede-openwrt-22.03-ipq60xx-
+          key: lede-master-ipq60xx-${{ hashFiles('lede/.config') }}
+          restore-keys: lede-master-ipq60xx-
 
-      - name: Clone Lean lede openwrt-22.03 branch
+      - name: Clone Lean lede master branch
         if: steps.cache-lede.outputs.cache-hit != 'true'
         run: |
-          git clone -b openwrt-22.03 --depth=1 https://github.com/coolsnowwolf/lede.git
+          git clone --depth=1 https://github.com/coolsnowwolf/lede.git
           cd lede
 
       - name: Update and install feeds
@@ -65,9 +65,12 @@ jobs:
       - name: Configure target ipq60xx/generic
         working-directory: lede
         run: |
+          # 先默认配置
           make defconfig || true
-          # 强制设置 ipq60xx/generic target
-          sed -i 's/^CONFIG_TARGET_.*=y/CONFIG_TARGET_ipq60xx=y\nCONFIG_TARGET_ipq60xx_generic=y/' .config
+          # 强制启用 ipq60xx/generic
+          sed -i '/CONFIG_TARGET_ipq60xx/d' .config
+          echo "CONFIG_TARGET_ipq60xx=y" >> .config
+          echo "CONFIG_TARGET_ipq60xx_generic=y" >> .config
           make defconfig
 
       - name: Pre-build host tools
@@ -78,21 +81,21 @@ jobs:
           make package/rust/host/compile V=s || true
           make package/boost/compile V=s || true
 
-      - name: Build dependency packages from packages.txt
+      - name: Build dependency packages
         working-directory: lede
         run: |
           while IFS= read -r pkg || [[ -n "$pkg" ]]; do
             [[ "$pkg" =~ ^#.*$ ]] && continue
             [[ -z "$pkg" ]] && continue
 
-            echo "Building package: $pkg"
-            make package/$pkg/compile -j$(nproc) V=s || echo "Warning: $pkg failed, continuing..."
+            echo "Building: $pkg"
+            make package/$pkg/compile -j$(nproc) V=s || echo "Warning: $pkg failed"
           done < ../packages.txt
 
-      - name: Collect built IPK files
+      - name: Collect IPK files
         run: |
           mkdir -p artifacts/passwall_packages
-          cd lede/bin/packages/aarch64_cortex-a53
+          cd lede/bin/packages/aarch64_cortex-a53 || exit 0
 
           while IFS= read -r pkg || [[ -n "$pkg" ]]; do
             [[ "$pkg" =~ ^#.*$ ]] && continue
@@ -102,31 +105,23 @@ jobs:
             fi
           done < ../../packages.txt
 
-      - name: Create zip archive
+      - name: Create zip
         working-directory: artifacts
         run: |
-          zip -r passwall_packages_ipk_aarch64_cortex-a53.zip passwall_packages || echo "Zip warning (possibly empty)"
+          zip -r passwall_packages_ipk_aarch64_cortex-a53.zip passwall_packages || echo "Zip may be empty"
           mv passwall_packages_ipk_aarch64_cortex-a53.zip ..
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: passwall2-dependency-ipks
+          name: passwall2-ipks
           path: passwall_packages_ipk_aarch64_cortex-a53.zip
-          retention-days: 14
 
-      - name: Create GitHub Release
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}-${{ github.run_id }}
-          name: Dependency Build ${{ github.run_number }} (${{ inputs.packages_ref }})
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
           body: |
-            Auto-built Passwall2 dependency IPKs from Lean lede openwrt-22.03 source
-
-            - packages ref: ${{ inputs.packages_ref }}
-            - Target: ipq60xx/generic (aarch64_cortex-a53)
-            - Date: $(date -u +"%Y-%m-%d %H:%M UTC")
-
-            Artifact:
-            - passwall_packages_ipk_aarch64_cortex-a53.zip
+            Built from Lean lede master (ipq60xx/generic)
           files: passwall_packages_ipk_aarch64_cortex-a53.zip
