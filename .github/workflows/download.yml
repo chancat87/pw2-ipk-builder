@@ -1,128 +1,108 @@
-name: Download Passwall2 Dependencies (No-Compile)
+name: Download Passwall2 IPKs (Official GitHub Release)
 
 on:
   workflow_dispatch:
-    inputs:
-      mirror_url:
-        description: 'SourceForge Mirror URL'
-        required: true
-        # 这是一个长期维护的 OpenWrt 21.02 aarch64_generic 仓库，完美兼容 ipq60xx
-        default: 'https://downloads.sourceforge.net/project/openwrt-passwall-build/releases/packages-21.02/aarch64_generic/passwall_packages'
+
+permissions:
+  contents: write
 
 jobs:
-  download_and_package:
+  download:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download IPKs
+      - name: Download from GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p downloads
-          cd downloads
           
-          echo "正在从 SourceForge 下载 OpenWrt 21.02 aarch64 依赖包..."
+          echo "1. 正在从 moetayuko 仓库下载 packages-21.02 (IPK版)..."
           
-          # 定义需要下载的包名映射（解决包名差异问题）
-          # 格式：关键词
-          # 脚本会自动匹配包含该关键词的最新 IPK
-          
-          TARGETS=(
-            "chinadns-ng"
-            "geoview"
-            "hysteria"
-            "naiveproxy"
-            "shadowsocks-rust" 
-            "shadowsocksr-libev"
-            "simple-obfs"
-            "sing-box"
-            "tcping"
-            "tuic"
-            "v2ray-plugin"
-            "xray-core"
-            "xray-plugin"
-          )
+          # 使用官方 gh 命令下载，更稳更快
+          # -p 指定文件名模式，只下载 aarch64 的 zip 包
+          gh release download packages-21.02 \
+            --repo moetayuko/openwrt-passwall-build \
+            --pattern "passwall_packages_aarch64_*.zip" \
+            --dir downloads
 
-          # 使用 wget 递归下载文件名列表，然后筛选下载
-          # SourceForge 的文件列表页面通常需要解析，这里我们用更聪明的方法：
-          # 直接利用 moetyuko 项目的文件命名规则
-          
-          # 为了保证稳定性，我们使用 'lftp' 或 'rclone' 更好，但 wget 够用了。
-          # 只要下载到包含关键词的文件即可。
-          
-          # 临时方案：下载该目录下的 index.json 或者直接遍历下载
-          # 由于 SourceForge 目录浏览受限，我们利用 GitHub Release 的镜像（如果存在），
-          # 或者直接尝试暴力匹配常见文件名。
-          
-          # 更稳妥的方案：使用作者的 GitHub Release 镜像（通常更新）
-          # 仓库: https://github.com/moetayuko/openwrt-passwall-build/releases
-          # 我们去抓取 tag 为 packages-21.02 的资源
-          
-          base_url="https://github.com/moetayuko/openwrt-passwall-build/releases/download/packages-21.02"
-          
-          # 必须下载的文件列表 (根据你的 packages.txt 智能推导)
-          # 注意：GitHub Releases 里通常是 zip，或者单个 ipk。
-          # 该项目在 release 里放的是 zip 包，我们需要下载 zip 并解压。
-          
-          echo "下载 passwall_packages.zip ..."
-          wget -q "${base_url}/passwall_packages_aarch64_generic.zip" || echo "GitHub 下载失败，尝试 SourceForge..."
-          
-          if [ ! -f "passwall_packages_aarch64_generic.zip" ]; then
-             echo "尝试从 SourceForge 列表解析下载（模拟）..."
-             # 由于直接下载单个文件链接复杂，我们推荐用户直接下载整个包
-             # 但为了完成 workflow，我们这里使用一个极其巧妙的技巧：
-             # 使用 'opkg download' 命令！利用官方镜像源！
-             # 不，我们直接去下载那个维护者打包好的 zip。
-             
-             # 重新尝试下载最可靠的源：
-             wget -O all_packages.zip "https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-21.02/aarch64_generic/passwall_packages/packages.zip?viasf=1" || true
+          # 检查下载结果
+          ZIP_FILE=$(ls downloads/*.zip | head -n 1)
+          if [ -z "$ZIP_FILE" ]; then
+             echo "::error::下载失败！未找到匹配的 zip 文件。"
+             exit 1
           fi
-          
-          # 如果上面都失败，我们使用 curl 解析 SourceForge 页面（虽然丑陋但有效）
-          # 或者，直接下载我们已知的几个核心大包（通常作者会打包成一个 zip）
-          
-          # 修正策略：moetayuko 项目在 GitHub Releases 里上传了 passwall_packages_ARCH.zip
-          wget -O packages.zip "https://github.com/moetayuko/openwrt-passwall-build/releases/latest/download/passwall_packages_aarch64_generic.zip" || \
-          wget -O packages.zip "https://github.com/moetayuko/openwrt-passwall-build/releases/download/packages-21.02/passwall_packages_aarch64_generic.zip"
+          echo "下载成功: $ZIP_FILE"
 
-          echo "解压中..."
-          unzip -o packages.zip -d extracted/
-          
-          echo "文件列表："
-          ls -R extracted/
-
-      - name: Filter and Repackage
+      - name: Extract and Filter
         run: |
           mkdir -p output
           
-          echo "根据 packages.txt 筛选文件..."
-          # 读取你的 packages.txt
-          while IFS= read -r pkg || [ -n "$pkg" ]; do
-            [[ "$pkg" =~ ^#.*$ ]] && continue
-            [[ -z "$pkg" ]] && continue
-            pkg=$(echo "$pkg" | tr -d '\r')
-            
-            echo "Searching for $pkg..."
-            # 在解压目录里查找包含该名字的 .ipk
-            find downloads/extracted -name "*${pkg}*.ipk" -exec cp {} output/ \;
-          done < packages.txt
+          # 获取 zip 文件路径
+          ZIP_FILE=$(ls downloads/*.zip | head -n 1)
           
-          # 额外补充：shadowsocks-rust 往往包含 sslocal/ssserver，如果没找到具体名字，就复制主包
-          if [ ! -f output/*shadowsocks-rust*.ipk ]; then
-             find downloads/extracted -name "*shadowsocks-rust*.ipk" -exec cp {} output/ \;
+          echo "2. 解压文件..."
+          # 解压到临时目录 extracted
+          unzip -q -o "$ZIP_FILE" -d extracted
+          
+          echo "3. 根据 packages.txt 筛选 IPK..."
+          
+          # 使用绝对路径定位 packages.txt，防止路径错误
+          PACKAGE_LIST="$GITHUB_WORKSPACE/packages.txt"
+          
+          if [ ! -f "$PACKAGE_LIST" ]; then
+             echo "::error::根目录下未找到 packages.txt！"
+             exit 1
           fi
 
-          echo "最终产物："
-          ls -lh output/
+          # 逐行读取清单
+          while IFS= read -r keyword || [ -n "$keyword" ]; do
+            # 跳过注释和空行
+            [[ "$keyword" =~ ^#.*$ ]] && continue
+            [[ -z "$keyword" ]] && continue
+            # 清理 Windows 回车符 (CRLF -> LF)
+            keyword=$(echo "$keyword" | tr -d '\r')
+            
+            echo "正在搜索: $keyword"
+            
+            # 使用 find 在解压目录(及其子目录)中查找包含关键词的 .ipk
+            # -exec cp 直接复制到 output 目录
+            find extracted -name "*${keyword}*.ipk" -exec cp {} output/ \;
+          done < "$PACKAGE_LIST"
+          
+          # ---------------------------------------------------------
+          # 额外兜底逻辑：处理命名不一致的情况
+          # ---------------------------------------------------------
+          # 如果清单里有 shadowsocks-rust，但没搜到文件（可能文件名叫 ss-rust 或其他），则暴力匹配
+          if grep -q "shadowsocks-rust" "$PACKAGE_LIST"; then
+             if ! ls output/*shadowsocks-rust*.ipk 1> /dev/null 2>&1; then
+                 echo "触发 Shadowsocks-Rust 兜底匹配..."
+                 find extracted -name "*shadowsocks-rust*.ipk" -exec cp {} output/ \;
+             fi
+          fi
 
-      - name: Create Zip
+          echo "------------------------------------------------"
+          echo "筛选完成，最终文件列表 (output 目录)："
+          ls -lh output/
+          echo "------------------------------------------------"
+
+      - name: Repackage
         run: |
           cd output
-          zip -r ../passwall_packages_ipq60xx_21.02.zip .
+          # 检查目录是否为空
+          if [ -z "$(ls -A .)" ]; then
+             echo "::error::筛选结果为空！请检查 packages.txt 的名称是否与源文件匹配。"
+             exit 1
+          fi
+          
+          # 打包
+          zip -r ../passwall_ipk_ipq60xx_ready.zip .
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: passwall_packages_ipq60xx_21.02
-          path: passwall_packages_ipq60xx_21.02.zip
+          name: passwall_ipk_ipq60xx_ready
+          path: passwall_ipk_ipq60xx_ready.zip
