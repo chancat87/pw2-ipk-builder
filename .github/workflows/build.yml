@@ -30,7 +30,7 @@ jobs:
             rsync unzip zlib1g-dev file wget curl python3 subversion \
             time xsltproc libelf-dev patch gawk unzip bc ccache ecj fastjar \
             java-propose-classpath libglib2.0-dev libzstd-dev \
-            python3-pyelftools quilt
+            python3-pyelftools quilt upx-ucl
 
       - name: Cache lede source
         uses: actions/cache@v4
@@ -50,86 +50,107 @@ jobs:
             git clone --depth=1 https://github.com/coolsnowwolf/lede.git
           fi
 
-      - name: Update and install feeds
+      - name: Update feeds
         working-directory: lede
         run: |
+          # 1. Update default feeds
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Add passwall_packages feed
+      - name: Add Passwall Source
         working-directory: lede
         run: |
+          # 2. Add passwall source via git clone to avoid feeds.conf conflicts
           rm -rf package/passwall_packages
           git clone --depth=1 --branch "${{ inputs.packages_ref }}" \
             https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git \
             package/passwall_packages
-          ./scripts/feeds update -a
+          
+          # 3. Install again to index new packages
           ./scripts/feeds install -a
 
-      - name: Configure target ipq60xx/generic
+      - name: Configure Target and Select Packages
         working-directory: lede
         run: |
-          make clean || true
           rm -f .config
+          
+          # 1. Target Configuration (ipq60xx/generic)
           echo "CONFIG_TARGET_ipq60xx=y" >> .config
           echo "CONFIG_TARGET_ipq60xx_generic=y" >> .config
           echo "CONFIG_TARGET_ROOTFS_PARTSIZE=512" >> .config
           
-          # 循环读取 packages.txt 并写入 .config
+          # 2. Force Host Tools (Crucial for xray/sing-box)
+          echo "CONFIG_PACKAGE_golang=y" >> .config
+          echo "CONFIG_PACKAGE_rust=y" >> .config
+          
+          # 3. Select Packages from list
           while IFS= read -r pkg || [ -n "$pkg" ]; do
             [[ "$pkg" =~ ^#.*$ ]] && continue
             [[ -z "$pkg" ]] && continue
-            # 移除行尾可能存在的 CR 字符
+            # Remove Windows carriage return
             pkg=$(echo "$pkg" | tr -d '\r')
             echo "CONFIG_PACKAGE_$pkg=m" >> .config
           done < ../packages.txt
           
           make defconfig
 
-      - name: Pre-build host tools
+      - name: Download Sources
         working-directory: lede
         run: |
-          make tools/install -j$(nproc) V=s || true
-          make toolchain/install -j$(nproc) V=s || true
+          make download -j8 || make download -j1 V=s
 
-      - name: Build dependency packages
+      - name: Compile Toolchain and Host Env
         working-directory: lede
         run: |
-          # 查找并编译包的函数
+          echo "::group::Build Toolchain"
+          make tools/install -j$(nproc) || make tools/install -j1 V=s
+          make toolchain/install -j$(nproc) || make toolchain/install -j1 V=s
+          echo "::endgroup::"
+          
+          echo "::group::Build Host Go/Rust"
+          # Explicitly compile host golang to prevent Xray build failures
+          # find -L finds the path even if it is a symlink
+          go_path=$(find -L package/ -name "golang" -type d | grep "lang/golang" | head -n 1)
+          if [ -n "$go_path" ]; then
+            echo "Compiling Host Go at $go_path"
+            make "$go_path/host/compile" -j$(nproc) || true
+          fi
+          echo "::endgroup::"
+
+      - name: Build Dependency Packages (Robust)
+        working-directory: lede
+        run: |
           compile_pkg() {
             pkg=$1
             echo "------ Processing: $pkg ------"
             
-            # 1. 尝试直接路径查找 (例如 chinadns-ng)
-            # find package -type d -name "chinadns-ng"
-            direct_path=$(find package -type d -name "$pkg" -print -quit)
+            # METHOD 1: Direct Directory Match
+            # Use find -L to follow symlinks (Critical Fix)
+            dir_match=$(find -L package/ -type d -name "$pkg" -print -quit)
             
-            if [ -n "$direct_path" ]; then
-              echo "Found path via dir name: $direct_path"
-              make "$direct_path/compile" -j$(nproc) V=s || echo "::error::Build failed for $pkg at $direct_path"
+            if [ -n "$dir_match" ]; then
+              echo "Found direct path: $dir_match"
+              make "$dir_match/compile" -j$(nproc) || make "$dir_match/compile" -j1 V=s || echo "::error::Build failed for $pkg"
               return
             fi
 
-            # 2. 如果找不到目录，尝试在 Makefile 中搜索 Package 定义
-            # (例如 shadowsocks-rust-sslocal 定义在 shadowsocks-rust 的 Makefile 中)
-            echo "Searching for package definition in Makefiles..."
-            grep_result=$(grep -r "define Package/$pkg" package/ | head -n 1)
+            # METHOD 2: Search in Makefiles (The "Safety Net")
+            # This finds "define Package/shadowsocks-rust-sslocal" inside "shadowsocks-rust/Makefile"
+            echo "Searching Makefiles (following symlinks)..."
+            makefile_match=$(find -L package/ -name Makefile -maxdepth 6 | xargs grep -l "define Package/$pkg" | head -n 1)
             
-            if [ -n "$grep_result" ]; then
-              makefile_path=$(echo "$grep_result" | cut -d: -f1)
-              src_dir=$(dirname "$makefile_path")
-              echo "Found definition in: $makefile_path"
-              echo "Compiling parent directory: $src_dir"
-              make "$src_dir/compile" -j$(nproc) V=s || echo "::error::Build failed for $pkg (parent: $src_dir)"
+            if [ -n "$makefile_match" ]; then
+              src_dir=$(dirname "$makefile_match")
+              echo "Found definition in: $src_dir"
+              make "$src_dir/compile" -j$(nproc) || make "$src_dir/compile" -j1 V=s || echo "::error::Build failed for $pkg (parent: $src_dir)"
             else
-              echo "::error::Could not find source directory for $pkg. Please check the package name."
+              echo "::error::FATAL: Could not find package '$pkg'. Checked dir names and Makefile definitions."
             fi
           }
 
           while IFS= read -r pkg || [ -n "$pkg" ]; do
             [[ "$pkg" =~ ^#.*$ ]] && continue
             [[ -z "$pkg" ]] && continue
-            # 清理包名中的回车符
             pkg=$(echo "$pkg" | tr -d '\r')
             compile_pkg "$pkg"
           done < ../packages.txt
@@ -137,18 +158,20 @@ jobs:
       - name: Collect IPK files
         run: |
           mkdir -p artifacts/passwall_packages
-          # 使用 find 搜集所有生成的 ipk，忽略路径差异
-          find lede/bin/packages -name "*.ipk" -exec cp {} artifacts/passwall_packages/ \;
-          echo "Collected IPKs:"
-          ls -lh artifacts/passwall_packages/
+          # Collect all IPKs, excluding kernel modules
+          find lede/bin/packages -name "*.ipk" | grep -v "kernel" | xargs -I {} cp {} artifacts/passwall_packages/
+          
+          count=$(ls artifacts/passwall_packages/ | wc -l)
+          echo "Collected $count IPK files."
+          
+          if [ "$count" -eq 0 ]; then
+             echo "::error::No IPK files generated! Compile failed."
+             exit 1
+          fi
 
       - name: Create zip
         working-directory: artifacts
         run: |
-          if [ -z "$(ls -A passwall_packages)" ]; then
-             echo "::error::No IPK files found to zip!"
-             exit 1
-          fi
           zip -r passwall_packages_ipk_aarch64_cortex-a53.zip passwall_packages
           mv passwall_packages_ipk_aarch64_cortex-a53.zip ..
 
