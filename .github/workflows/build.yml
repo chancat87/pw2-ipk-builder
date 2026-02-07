@@ -59,14 +59,10 @@ jobs:
       - name: Add passwall_packages feed
         working-directory: lede
         run: |
-          # 关键修复：先删除旧目录，防止 git clone 冲突
           rm -rf package/passwall_packages
-          
           git clone --depth=1 --branch "${{ inputs.packages_ref }}" \
             https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git \
             package/passwall_packages
-            
-          # 再次更新 feeds 以索引新加入的包
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
@@ -75,53 +71,84 @@ jobs:
         run: |
           make clean || true
           rm -f .config
-          
-          # 1. 设置目标架构
           echo "CONFIG_TARGET_ipq60xx=y" >> .config
           echo "CONFIG_TARGET_ipq60xx_generic=y" >> .config
           echo "CONFIG_TARGET_ROOTFS_PARTSIZE=512" >> .config
           
-          # 2. 关键修复：从 packages.txt 读取包名并写入 .config
-          # 只有显式设置为 'm' (编译模块)，编译系统才会正确处理所有依赖
+          # 循环读取 packages.txt 并写入 .config
           while IFS= read -r pkg || [ -n "$pkg" ]; do
             [[ "$pkg" =~ ^#.*$ ]] && continue
             [[ -z "$pkg" ]] && continue
+            # 移除行尾可能存在的 CR 字符
+            pkg=$(echo "$pkg" | tr -d '\r')
             echo "CONFIG_PACKAGE_$pkg=m" >> .config
           done < ../packages.txt
           
-          # 3. 生成完整配置
           make defconfig
 
-      - name: Pre-build host tools and toolchain
+      - name: Pre-build host tools
         working-directory: lede
         run: |
-          # 增加 toolchain/install 确保交叉编译环境就绪
           make tools/install -j$(nproc) V=s || true
           make toolchain/install -j$(nproc) V=s || true
 
       - name: Build dependency packages
         working-directory: lede
         run: |
-          # 此时 .config 已包含 packages.txt 的内容，
-          # 我们可以直接编译，或者用循环确保每个包都被触发
+          # 查找并编译包的函数
+          compile_pkg() {
+            pkg=$1
+            echo "------ Processing: $pkg ------"
+            
+            # 1. 尝试直接路径查找 (例如 chinadns-ng)
+            # find package -type d -name "chinadns-ng"
+            direct_path=$(find package -type d -name "$pkg" -print -quit)
+            
+            if [ -n "$direct_path" ]; then
+              echo "Found path via dir name: $direct_path"
+              make "$direct_path/compile" -j$(nproc) V=s || echo "::error::Build failed for $pkg at $direct_path"
+              return
+            fi
+
+            # 2. 如果找不到目录，尝试在 Makefile 中搜索 Package 定义
+            # (例如 shadowsocks-rust-sslocal 定义在 shadowsocks-rust 的 Makefile 中)
+            echo "Searching for package definition in Makefiles..."
+            grep_result=$(grep -r "define Package/$pkg" package/ | head -n 1)
+            
+            if [ -n "$grep_result" ]; then
+              makefile_path=$(echo "$grep_result" | cut -d: -f1)
+              src_dir=$(dirname "$makefile_path")
+              echo "Found definition in: $makefile_path"
+              echo "Compiling parent directory: $src_dir"
+              make "$src_dir/compile" -j$(nproc) V=s || echo "::error::Build failed for $pkg (parent: $src_dir)"
+            else
+              echo "::error::Could not find source directory for $pkg. Please check the package name."
+            fi
+          }
+
           while IFS= read -r pkg || [ -n "$pkg" ]; do
             [[ "$pkg" =~ ^#.*$ ]] && continue
             [[ -z "$pkg" ]] && continue
-            echo "Building $pkg ..."
-            make package/"$pkg"/compile -j$(nproc) || make package/"$pkg"/compile -j1 V=s
+            # 清理包名中的回车符
+            pkg=$(echo "$pkg" | tr -d '\r')
+            compile_pkg "$pkg"
           done < ../packages.txt
 
       - name: Collect IPK files
         run: |
           mkdir -p artifacts/passwall_packages
-          # 稍微放宽 find 条件，确保找到所有生成的 ipk
-          find lede/bin/packages -name "*.ipk" | xargs -I {} cp {} artifacts/passwall_packages/
+          # 使用 find 搜集所有生成的 ipk，忽略路径差异
+          find lede/bin/packages -name "*.ipk" -exec cp {} artifacts/passwall_packages/ \;
           echo "Collected IPKs:"
           ls -lh artifacts/passwall_packages/
 
       - name: Create zip
         working-directory: artifacts
         run: |
+          if [ -z "$(ls -A passwall_packages)" ]; then
+             echo "::error::No IPK files found to zip!"
+             exit 1
+          fi
           zip -r passwall_packages_ipk_aarch64_cortex-a53.zip passwall_packages
           mv passwall_packages_ipk_aarch64_cortex-a53.zip ..
 
@@ -133,8 +160,6 @@ jobs:
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          tag_name: build-${{ github.run_number }}
-          name: Build ${{ github.run_number }}
-          body: Built from Lean lede master (ipq60xx/generic)
           files: passwall_packages_ipk_aarch64_cortex-a53.zip
