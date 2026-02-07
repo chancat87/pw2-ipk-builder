@@ -1,10 +1,7 @@
-name: Download Passwall2 IPKs (Official GitHub Release)
+name: Download Passwall2 IPKs (SourceForge 21.02 Direct)
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   download:
@@ -14,91 +11,102 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download from GitHub Releases
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p downloads
-          
-          echo "1. 正在从 moetayuko 仓库下载 packages-21.02 (IPK版)..."
-          
-          # 使用官方 gh 命令下载，更稳更快
-          # -p 指定文件名模式，只下载 aarch64 的 zip 包
-          gh release download packages-21.02 \
-            --repo moetayuko/openwrt-passwall-build \
-            --pattern "passwall_packages_aarch64_*.zip" \
-            --dir downloads
-
-          # 检查下载结果
-          ZIP_FILE=$(ls downloads/*.zip | head -n 1)
-          if [ -z "$ZIP_FILE" ]; then
-             echo "::error::下载失败！未找到匹配的 zip 文件。"
-             exit 1
-          fi
-          echo "下载成功: $ZIP_FILE"
-
-      - name: Extract and Filter
+      - name: Download from SourceForge
         run: |
           mkdir -p output
+          cd output
           
-          # 获取 zip 文件路径
-          ZIP_FILE=$(ls downloads/*.zip | head -n 1)
+          # --------------------------------------------------------------------------------
+          # 核心修正：
+          # 1. 使用 SourceForge 21.02 源 (IPK格式)
+          # 2. 锁定架构 aarch64_cortex-a53 (ipq60xx)
+          # --------------------------------------------------------------------------------
+          BASE_URL="https://downloads.sourceforge.net/project/openwrt-passwall-build/releases/packages-21.02/aarch64_cortex-a53/passwall_packages"
           
-          echo "2. 解压文件..."
-          # 解压到临时目录 extracted
-          unzip -q -o "$ZIP_FILE" -d extracted
+          echo "1. 下载 Packages 索引文件 (获取真实文件名)..."
+          # 使用 wget 下载索引，失败则重试
+          wget -q --tries=3 --timeout=10 "$BASE_URL/Packages" -O Packages
           
-          echo "3. 根据 packages.txt 筛选 IPK..."
-          
-          # 使用绝对路径定位 packages.txt，防止路径错误
-          PACKAGE_LIST="$GITHUB_WORKSPACE/packages.txt"
-          
-          if [ ! -f "$PACKAGE_LIST" ]; then
-             echo "::error::根目录下未找到 packages.txt！"
+          if [ ! -s Packages ]; then
+             echo "::error::无法连接到 SourceForge 21.02 源，请检查网络或源地址。"
              exit 1
           fi
 
-          # 逐行读取清单
+          echo "2. 开始精准匹配并下载..."
+          
+          # 绝对路径读取清单
+          PACKAGE_LIST="$GITHUB_WORKSPACE/packages.txt"
+          
           while IFS= read -r keyword || [ -n "$keyword" ]; do
-            # 跳过注释和空行
             [[ "$keyword" =~ ^#.*$ ]] && continue
             [[ -z "$keyword" ]] && continue
-            # 清理 Windows 回车符 (CRLF -> LF)
             keyword=$(echo "$keyword" | tr -d '\r')
             
-            echo "正在搜索: $keyword"
+            echo "--- 处理: $keyword ---"
             
-            # 使用 find 在解压目录(及其子目录)中查找包含关键词的 .ipk
-            # -exec cp 直接复制到 output 目录
-            find extracted -name "*${keyword}*.ipk" -exec cp {} output/ \;
+            # 【核心逻辑】从 Packages 文件中提取 Filename
+            # 逻辑：查找 "Package: keyword" 对应的 "Filename: xxx.ipk"
+            # 如果找不到完全匹配的包名，尝试模糊匹配文件名
+            
+            # 尝试1: 精准匹配包名 (Package: name)
+            target_file=$(awk -v pkg="$keyword" 'BEGIN{RS=""; FS="\n"} $0 ~ "Package: "pkg {for(i=1;i<=NF;i++) if($i ~ /^Filename:/) {print $i; exit}}' Packages | cut -d: -f2 | tr -d ' ')
+            
+            # 尝试2: 如果精准匹配失败，尝试模糊匹配文件名 (Filename: ...keyword...)
+            if [ -z "$target_file" ]; then
+               echo "   (精准匹配失败，尝试文件名模糊搜索...)"
+               target_file=$(grep "Filename:" Packages | grep "$keyword" | head -n 1 | cut -d: -f2 | tr -d ' ')
+            fi
+            
+            if [ -n "$target_file" ]; then
+              echo "   -> 锁定目标: $target_file"
+              
+              # 检查文件是否已下载
+              if [ -f "$target_file" ]; then
+                 echo "   -> 文件已存在，跳过。"
+              else
+                 echo "   -> 正在下载..."
+                 wget -q --show-progress "$BASE_URL/$target_file" -O "$target_file"
+                 
+                 if [ $? -eq 0 ]; then
+                    echo "   -> 成功。"
+                 else
+                    echo "::warning::下载失败: $target_file"
+                 fi
+              fi
+            else
+              echo "::warning::源中未找到包含 '$keyword' 的包！"
+            fi
+            
           done < "$PACKAGE_LIST"
-          
+
           # ---------------------------------------------------------
-          # 额外兜底逻辑：处理命名不一致的情况
+          # 兜底：处理 shadowsocks-rust 可能的命名差异
           # ---------------------------------------------------------
-          # 如果清单里有 shadowsocks-rust，但没搜到文件（可能文件名叫 ss-rust 或其他），则暴力匹配
           if grep -q "shadowsocks-rust" "$PACKAGE_LIST"; then
-             if ! ls output/*shadowsocks-rust*.ipk 1> /dev/null 2>&1; then
-                 echo "触发 Shadowsocks-Rust 兜底匹配..."
-                 find extracted -name "*shadowsocks-rust*.ipk" -exec cp {} output/ \;
+             if ! ls *shadowsocks-rust*.ipk 1> /dev/null 2>&1; then
+                 echo "触发 SS-Rust 兜底下载..."
+                 # 尝试下载包含 ss-local 或 ss-server 的包
+                 grep "Filename: .*shadowsocks.*rust.*" Packages | cut -d: -f2 | tr -d ' ' | while read -r f; do
+                    wget -q "$BASE_URL/$f" -O "$f"
+                 done
              fi
           fi
+          
+          # 清理索引文件
+          rm -f Packages
 
           echo "------------------------------------------------"
-          echo "筛选完成，最终文件列表 (output 目录)："
-          ls -lh output/
+          echo "下载完成，清单如下："
+          ls -lh *.ipk
           echo "------------------------------------------------"
 
       - name: Repackage
         run: |
           cd output
-          # 检查目录是否为空
           if [ -z "$(ls -A .)" ]; then
-             echo "::error::筛选结果为空！请检查 packages.txt 的名称是否与源文件匹配。"
+             echo "::error::没有下载到任何文件！请检查 packages.txt 内容。"
              exit 1
           fi
-          
-          # 打包
           zip -r ../passwall_ipk_ipq60xx_ready.zip .
 
       - name: Upload Artifact
