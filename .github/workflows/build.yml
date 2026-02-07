@@ -85,11 +85,11 @@ jobs:
         run: |
           ls -la bin/packages || echo "bin/packages not exist yet"
           while IFS= read -r pkg || [[ -n "$pkg" ]]; do
-            [[ "\( pkg" =~ ^#.* \) ]] && continue
+            [[ "$pkg" =~ ^#.*$ ]] && continue
             [[ -z "$pkg" ]] && continue
             echo "Building: $pkg"
             make package/"$pkg"/clean V=s || true
-            make package/"\( pkg"/compile -j \)(nproc) V=s || echo "Warning: $pkg failed"
+            make package/"$pkg"/compile -j$(nproc) V=s || echo "Warning: $pkg failed"
           done < ../packages.txt
 
       - name: Debug: List generated IPK files
@@ -104,7 +104,7 @@ jobs:
           mkdir -p artifacts/passwall_packages
           cd lede/bin/packages/aarch64_cortex-a53 || exit 0
           while IFS= read -r pkg || [[ -n "$pkg" ]]; do
-            [[ "\( pkg" =~ ^#.* \) ]] && continue
+            [[ "$pkg" =~ ^#.*$ ]] && continue
             [[ -z "$pkg" ]] && continue
             if [[ "$pkg" != "v2ray-geoip" && "$pkg" != "v2ray-geosite" ]]; then
               find . -name "${pkg}_*.ipk" -exec cp {} ../../../artifacts/passwall_packages/ \; 2>/dev/null || true
