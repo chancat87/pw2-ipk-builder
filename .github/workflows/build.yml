@@ -1,20 +1,25 @@
-name: Build Passwall2 Dependency IPKs from Lean lede master
-'on':
+name: Build Passwall2 Dependency IPKs
+
+on:
   workflow_dispatch:
     inputs:
       packages_ref:
-        description: openwrt-passwall-packages ref (tag/branch/commit)
+        description: 'openwrt-passwall-packages ref (tag/branch/commit)'
         required: false
-        default: main
+        default: 'main'
         type: string
+
 permissions:
   contents: write
+
 jobs:
   build:
     runs-on: ubuntu-22.04
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -26,23 +31,29 @@ jobs:
             time xsltproc libelf-dev patch gawk unzip bc ccache ecj fastjar \
             java-propose-classpath libglib2.0-dev libzstd-dev \
             python3-pyelftools quilt
+
       - name: Cache lede source
         uses: actions/cache@v4
-        id: cache-lede
         with:
           path: lede
           key: lede-master-ipq60xx
-          restore-keys: |
-            lede-master-ipq60xx-
-      - name: Clone Lean lede master branch
-        if: steps.cache-lede.outputs.cache-hit != 'true'
+
+      - name: Clone or update Lean lede master branch
         run: |
-          git clone --depth=1 https://github.com/coolsnowwolf/lede.git lede
+          if [ -d "lede" ]; then
+            cd lede
+            git fetch --depth=1
+            git reset --hard origin/master
+          else
+            git clone --depth=1 https://github.com/coolsnowwolf/lede.git
+          fi
+
       - name: Update and install feeds
         working-directory: lede
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+
       - name: Add passwall_packages feed
         working-directory: lede
         run: |
@@ -51,7 +62,8 @@ jobs:
             package/passwall_packages
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-      - name: Clean previous build and configure target ipq60xx/generic
+
+      - name: Configure target ipq60xx/generic
         working-directory: lede
         run: |
           make clean || true
@@ -60,42 +72,45 @@ jobs:
           echo "CONFIG_TARGET_ipq60xx_generic=y" >> .config
           echo "CONFIG_TARGET_ROOTFS_PARTSIZE=512" >> .config
           make defconfig
+
       - name: Pre-build host tools
         working-directory: lede
         run: |
-          make tools/install -j$(nproc) || make tools/install V=s
-          make toolchain/install -j$(nproc) || make toolchain/install V=s
+          make tools/install V=s || true
           make package/golang/host/compile V=s || true
+          make package/rust/host/compile V=s || true
+
       - name: Build dependency packages
         working-directory: lede
         run: |
           while IFS= read -r pkg || [ -n "$pkg" ]; do
             [[ "$pkg" =~ ^#.*$ ]] && continue
             [[ -z "$pkg" ]] && continue
-            echo "Building: $pkg"
+            make package/"$pkg"/clean V=s || true
             make package/"$pkg"/compile -j$(nproc) V=s || echo "Warning: $pkg failed"
           done < ../packages.txt
-      - name: Collect IPK files
-        run: >
-          mkdir -p artifacts/passwall_packages
 
-          find lede/bin/packages/ -name "*.ipk" | grep -v "v2ray-geo" | xargs -i
-          cp {} artifacts/passwall_packages/ || true
-      - name: Create zip
+      - name: Collect IPK files
         run: |
-          cd artifacts
-          zip -r ../passwall_packages_ipk_aarch64_cortex-a53.zip .
-          cd ..
+          mkdir -p artifacts/passwall_packages
+          find lede/bin/packages -name "*.ipk" -exec cp {} artifacts/passwall_packages/ \; 2>/dev/null || true
+
+      - name: Create zip
+        working-directory: artifacts
+        run: |
+          zip -r passwall_packages_ipk_aarch64_cortex-a53.zip passwall_packages
+          mv passwall_packages_ipk_aarch64_cortex-a53.zip ..
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: passwall2-ipks
           path: passwall_packages_ipk_aarch64_cortex-a53.zip
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/heads/')
         with:
-          tag_name: build-${{ github.run_number }}-${{ github.run_id }}
+          tag_name: build-${{ github.run_number }}
           name: Build ${{ github.run_number }}
           body: Built from Lean lede master (ipq60xx/generic)
           files: passwall_packages_ipk_aarch64_cortex-a53.zip
