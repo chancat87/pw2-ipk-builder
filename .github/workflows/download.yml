@@ -1,10 +1,13 @@
-name: Download Passwall2 IPKs (Strict Index Mode)
+name: Download ALL Passwall2 IPKs (SourceForge Mirror)
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  download:
+  download_all:
     runs-on: ubuntu-latest
 
     steps:
@@ -23,152 +26,107 @@ jobs:
         run: |
           mkdir -p output
           
-          # 创建 Python 脚本
+          # 创建全量下载脚本
           cat << 'EOF' > downloader.py
           import requests
           import os
           import sys
           import gzip
-          import io
 
-          # =================配置区域=================
-          # 你的目标地址 (注意：这是下载专用的 API 域名，不是网页浏览域名)
-          # 路径对应：releases/packages-21.02/aarch64_cortex-a53/passwall_packages
+          # 目标源：SourceForge OpenWrt 21.02 ipq60xx 专用源
           BASE_URL = "https://downloads.sourceforge.net/project/openwrt-passwall-build/releases/packages-21.02/aarch64_cortex-a53/passwall_packages"
-          
-          # 伪装 Header，防止被当成脚本拦截
-          HEADERS = {
-              'User-Agent': 'Wget/1.21.2 (linux-gnu)',
-              'Accept': '*/*'
-          }
-          # ===========================================
+          HEADERS = {'User-Agent': 'Wget/1.21.2 (linux-gnu)', 'Accept': '*/*'}
 
-          def get_index_content(url):
-              print(f"正在获取索引: {url}")
-              try:
-                  r = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
-                  if r.status_code == 404:
-                      return None
+          # 1. 获取索引 (Packages 文件)
+          print(f"1. 连接源: {BASE_URL}")
+          try:
+              # 尝试下载 Packages
+              r = requests.get(f"{BASE_URL}/Packages", headers=HEADERS, timeout=30, allow_redirects=True)
+              if r.status_code == 404:
+                  print("Packages 纯文本不存在，尝试 Packages.gz...")
+                  r = requests.get(f"{BASE_URL}/Packages.gz", headers=HEADERS, timeout=30, allow_redirects=True)
                   r.raise_for_status()
-                  return r.content
-              except Exception as e:
-                  print(f"获取失败: {e}")
-                  return None
-
-          # 1. 下载 Packages 索引文件
-          # 优先尝试纯文本，如果不存在尝试 .gz
-          content = get_index_content(f"{BASE_URL}/Packages")
-          
-          if not content:
-              print("尝试下载 Packages.gz ...")
-              gz_content = get_index_content(f"{BASE_URL}/Packages.gz")
-              if gz_content:
-                  try:
-                      content = gzip.decompress(gz_content)
-                  except:
-                      print("解压 Packages.gz 失败")
-                      sys.exit(1)
-          
-          if not content:
-              print("❌ 严重错误：无法获取 Packages 索引文件。请确认架构路径是否正确。")
+                  content = gzip.decompress(r.content).decode('utf-8', errors='ignore')
+              else:
+                  r.raise_for_status()
+                  content = r.content.decode('utf-8', errors='ignore')
+          except Exception as e:
+              print(f"❌ 索引下载失败: {e}")
               sys.exit(1)
 
-          text_content = content.decode('utf-8', errors='ignore')
-
-          # 检查是否误下载了 SourceForge 的 HTML 错误页
-          if "<html" in text_content.lower() and "doctype" in text_content.lower():
-              print("❌ 错误：获取到的是 HTML 页面而不是索引。说明路径错误或被拦截。")
-              print("返回内容摘要:", text_content[:200])
+          if "<html" in content.lower():
+              print("❌ 错误: 被 SourceForge 拦截，返回了 HTML 页面。")
               sys.exit(1)
 
-          print("✅ 索引获取成功，解析中...")
-
-          # 2. 解析索引 (构建 Package -> Filename 映射)
-          pkg_map = {}
-          current_pkg = None
-          
-          for line in text_content.splitlines():
+          # 2. 解析所有文件名
+          filenames = []
+          for line in content.splitlines():
               line = line.strip()
-              if line.startswith("Package:"):
-                  current_pkg = line.split(":", 1)[1].strip()
-              elif line.startswith("Filename:") and current_pkg:
-                  filename = line.split(":", 1)[1].strip()
-                  pkg_map[current_pkg] = filename
-                  current_pkg = None
+              if line.startswith("Filename:"):
+                  fname = line.split(":", 1)[1].strip()
+                  if fname.endswith(".ipk"):
+                      filenames.append(fname)
           
-          print(f"📊 索引包含 {len(pkg_map)} 个软件包。")
+          # 去重
+          filenames = sorted(list(set(filenames)))
+          total_files = len(filenames)
+          print(f"✅ 索引解析成功，源中共有 {total_files} 个 IPK 文件。")
+          print("🚀 准备全部下载！")
 
-          # 3. 读取用户清单
-          if not os.path.exists("packages.txt"):
-              print("❌ 找不到 packages.txt")
-              sys.exit(1)
-
-          with open("packages.txt", "r") as f:
-              targets = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-
-          # 4. 匹配并下载
+          # 3. 批量下载
           downloaded_count = 0
           
-          for target in targets:
-              print(f"\n🔍 寻找: {target}")
+          for i, filename in enumerate(filenames, 1):
+              file_url = f"{BASE_URL}/{filename}"
+              save_path = f"output/{filename}"
               
-              # 策略 A: 精确匹配包名
-              filename = pkg_map.get(target)
+              print(f"[{i}/{total_files}] 下载: {filename}")
               
-              # 策略 B: 如果精确匹配失败，尝试在所有文件名中搜索
-              if not filename:
-                  # 比如 target 是 shadowsocks-rust-sslocal，但源里文件名叫 shadowsocks-rust_...ipk
-                  # 我们搜索包含 target 字符串的文件名
-                  candidates = [fname for pname, fname in pkg_map.items() if target in fname or target in pname]
-                  if candidates:
-                      # 取最短的通常是主包
-                      candidates.sort(key=len)
-                      filename = candidates[0]
-                      print(f"   (模糊匹配成功: {filename})")
+              if os.path.exists(save_path):
+                  print("   ⏩ 已存在，跳过")
+                  continue
 
-              if filename:
-                  print(f"   ✅ 锁定文件: {filename}")
-                  file_url = f"{BASE_URL}/{filename}"
-                  save_path = f"output/{filename}"
+              try:
+                  with requests.get(file_url, headers=HEADERS, stream=True, timeout=60) as r:
+                      r.raise_for_status()
+                      with open(save_path, 'wb') as f:
+                          for chunk in r.iter_content(chunk_size=8192):
+                              f.write(chunk)
                   
-                  if os.path.exists(save_path):
-                      print("      文件已存在，跳过。")
-                      continue
+                  if os.path.getsize(save_path) > 1024:
+                      downloaded_count += 1
+                  else:
+                      print("   ⚠️ 失败: 文件过小")
+                      if os.path.exists(save_path): os.remove(save_path)
+              except Exception as e:
+                  print(f"   ❌ 下载异常: {e}")
 
-                  try:
-                      print("      ⬇️ 下载中...")
-                      # stream=True 避免大文件占满内存
-                      with requests.get(file_url, headers=HEADERS, stream=True, timeout=60) as r:
-                          r.raise_for_status()
-                          with open(save_path, 'wb') as f:
-                              for chunk in r.iter_content(chunk_size=8192):
-                                  f.write(chunk)
-                      
-                      if os.path.getsize(save_path) > 1024:
-                          print("      🆗 下载完成")
-                          downloaded_count += 1
-                      else:
-                          print("      ⚠️ 文件过小，可能下载失败")
-                  except Exception as e:
-                      print(f"      ❌ 下载出错: {e}")
-              else:
-                  print(f"   ⚠️ 源中未找到: {target}")
-
-          print(f"\n🎉 任务结束。共下载 {downloaded_count} 个文件。")
+          print(f"\n🎉 任务完成！成功下载 {downloaded_count} / {total_files} 个文件。")
           if downloaded_count == 0:
               sys.exit(1)
           EOF
           
-          # 运行脚本
           python3 downloader.py
 
-      - name: Repackage
+      - name: Create Zip for Release
         run: |
           cd output
-          zip -r ../passwall_ipk_final.zip .
+          # 打包所有下载下来的 ipk
+          zip -r ../passwall_packages_all_ipq60xx.zip .
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: passwall_ipk_final
-          path: passwall_ipk_final.zip
+          tag_name: build-all-${{ github.run_number }}
+          name: Build ${{ github.run_number }} (All Packages)
+          body: |
+            ✅ 已从 SourceForge 全量下载所有 Passwall 依赖包。
+            
+            **信息摘要：**
+            - 源：`moetayuko/openwrt-passwall-build` (packages-21.02)
+            - 架构：`aarch64_cortex-a53` (ipq60xx)
+            - 策略：全量下载 (Download All)
+            
+            📦 **包含了 xray, sing-box, shadowsocks 等所有相关组件**
+            请下载 zip 后解压，根据需要选择安装。
+          files: passwall_packages_all_ipq60xx.zip
