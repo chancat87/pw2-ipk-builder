@@ -1,4 +1,4 @@
-name: Download Passwall2 IPKs (SourceForge 21.02 Direct)
+name: Download Passwall2 IPKs (HTML Scraper)
 
 on:
   workflow_dispatch:
@@ -8,109 +8,130 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download from SourceForge
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Scrape and Download
         run: |
           mkdir -p output
-          cd output
           
-          # --------------------------------------------------------------------------------
-          # 核心修正：
-          # 1. 使用 SourceForge 21.02 源 (IPK格式)
-          # 2. 锁定架构 aarch64_cortex-a53 (ipq60xx)
-          # --------------------------------------------------------------------------------
-          BASE_URL="https://downloads.sourceforge.net/project/openwrt-passwall-build/releases/packages-21.02/aarch64_cortex-a53/passwall_packages"
-          
-          echo "1. 下载 Packages 索引文件 (获取真实文件名)..."
-          # 使用 wget 下载索引，失败则重试
-          wget -q --tries=3 --timeout=10 "$BASE_URL/Packages" -O Packages
-          
-          if [ ! -s Packages ]; then
-             echo "::error::无法连接到 SourceForge 21.02 源，请检查网络或源地址。"
-             exit 1
-          fi
+          # 创建 Python 脚本
+          cat << 'EOF' > scraper.py
+          import requests
+          from bs4 import BeautifulSoup
+          import os
+          import urllib.parse
 
-          echo "2. 开始精准匹配并下载..."
+          # 1. 配置
+          # 这就是你给的那个“肉眼可见”的网页地址
+          PAGE_URL = "https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-21.02/aarch64_cortex-a53/passwall_packages/"
           
-          # 绝对路径读取清单
-          PACKAGE_LIST="$GITHUB_WORKSPACE/packages.txt"
+          # 对应的真实下载前缀 (SourceForge 的规律: /files/ -> /project/ 且域名变 downloads)
+          DOWNLOAD_BASE = "https://downloads.sourceforge.net/project/openwrt-passwall-build/releases/packages-21.02/aarch64_cortex-a53/passwall_packages"
+
+          print(f"正在扫描页面: {PAGE_URL}")
+
+          # 2. 获取网页内容
+          headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+          try:
+              resp = requests.get(PAGE_URL, headers=headers)
+              resp.raise_for_status()
+          except Exception as e:
+              print(f"网页访问失败: {e}")
+              exit(1)
+
+          # 3. 解析网页中的所有 IPK 文件名
+          soup = BeautifulSoup(resp.text, 'html.parser')
+          available_files = []
           
-          while IFS= read -r keyword || [ -n "$keyword" ]; do
-            [[ "$keyword" =~ ^#.*$ ]] && continue
-            [[ -z "$keyword" ]] && continue
-            keyword=$(echo "$keyword" | tr -d '\r')
-            
-            echo "--- 处理: $keyword ---"
-            
-            # 【核心逻辑】从 Packages 文件中提取 Filename
-            # 逻辑：查找 "Package: keyword" 对应的 "Filename: xxx.ipk"
-            # 如果找不到完全匹配的包名，尝试模糊匹配文件名
-            
-            # 尝试1: 精准匹配包名 (Package: name)
-            target_file=$(awk -v pkg="$keyword" 'BEGIN{RS=""; FS="\n"} $0 ~ "Package: "pkg {for(i=1;i<=NF;i++) if($i ~ /^Filename:/) {print $i; exit}}' Packages | cut -d: -f2 | tr -d ' ')
-            
-            # 尝试2: 如果精准匹配失败，尝试模糊匹配文件名 (Filename: ...keyword...)
-            if [ -z "$target_file" ]; then
-               echo "   (精准匹配失败，尝试文件名模糊搜索...)"
-               target_file=$(grep "Filename:" Packages | grep "$keyword" | head -n 1 | cut -d: -f2 | tr -d ' ')
-            fi
-            
-            if [ -n "$target_file" ]; then
-              echo "   -> 锁定目标: $target_file"
+          # SourceForge 的文件列表通常在 tr.file > th > a 标签中
+          for a_tag in soup.find_all('a'):
+              href = a_tag.get('href', '')
+              title = a_tag.get('title', '')
               
-              # 检查文件是否已下载
-              if [ -f "$target_file" ]; then
-                 echo "   -> 文件已存在，跳过。"
-              else
-                 echo "   -> 正在下载..."
-                 wget -q --show-progress "$BASE_URL/$target_file" -O "$target_file"
-                 
-                 if [ $? -eq 0 ]; then
-                    echo "   -> 成功。"
-                 else
-                    echo "::warning::下载失败: $target_file"
-                 fi
-              fi
-            else
-              echo "::warning::源中未找到包含 '$keyword' 的包！"
-            fi
-            
-          done < "$PACKAGE_LIST"
+              # 提取文件名：如果是 .ipk 结尾
+              if title.endswith('.ipk'):
+                  available_files.append(title)
+              elif href.endswith('.ipk/download'): # 备用匹配逻辑
+                  name = href.split('/')[-2]
+                  available_files.append(name)
 
-          # ---------------------------------------------------------
-          # 兜底：处理 shadowsocks-rust 可能的命名差异
-          # ---------------------------------------------------------
-          if grep -q "shadowsocks-rust" "$PACKAGE_LIST"; then
-             if ! ls *shadowsocks-rust*.ipk 1> /dev/null 2>&1; then
-                 echo "触发 SS-Rust 兜底下载..."
-                 # 尝试下载包含 ss-local 或 ss-server 的包
-                 grep "Filename: .*shadowsocks.*rust.*" Packages | cut -d: -f2 | tr -d ' ' | while read -r f; do
-                    wget -q "$BASE_URL/$f" -O "$f"
-                 done
-             fi
-          fi
+          # 去重
+          available_files = list(set(available_files))
+          print(f"页面上共找到 {len(available_files)} 个 IPK 文件。")
+          # print(available_files) # 调试用
+
+          # 4. 读取你的需求清单
+          if not os.path.exists("packages.txt"):
+              print("错误：找不到 packages.txt")
+              exit(1)
+              
+          with open("packages.txt", 'r') as f:
+              targets = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+          # 5. 匹配并下载
+          downloaded_count = 0
           
-          # 清理索引文件
-          rm -f Packages
+          for keyword in targets:
+              print(f"\n--- 寻找: {keyword} ---")
+              
+              # 模糊匹配：只要文件名包含关键词
+              matches = [f for f in available_files if keyword in f]
+              
+              if not matches:
+                  print(f"   未找到包含 '{keyword}' 的文件")
+                  continue
+                  
+              # 如果有多个匹配，优先选最短的（通常最精准），或者选包含版本号最新的
+              # 这里简单粗暴：选第一个包含该关键词的
+              target_file = matches[0]
+              
+              # 特殊处理 shadowsocks-rust：确保下对
+              if keyword == "shadowsocks-rust":
+                  # 优先找 ss-local 或 ss-server 没意义，通常有一个主包或者包含所有
+                  pass
 
-          echo "------------------------------------------------"
-          echo "下载完成，清单如下："
-          ls -lh *.ipk
-          echo "------------------------------------------------"
+              print(f"   锁定文件: {target_file}")
+              
+              # 构造下载链接
+              download_url = f"{DOWNLOAD_BASE}/{target_file}"
+              save_path = os.path.join("output", target_file)
+              
+              print(f"   正在下载...")
+              try:
+                  r = requests.get(download_url, headers=headers, stream=True)
+                  r.raise_for_status()
+                  with open(save_path, 'wb') as f:
+                      for chunk in r.iter_content(chunk_size=8192):
+                          f.write(chunk)
+                  print("   下载成功！")
+                  downloaded_count += 1
+              except Exception as e:
+                  print(f"   下载失败: {e}")
+
+          print(f"\n任务完成！共下载 {downloaded_count} 个文件。")
+          if downloaded_count == 0:
+              exit(1)
+          
+          EOF
+          
+          python3 scraper.py
 
       - name: Repackage
         run: |
           cd output
-          if [ -z "$(ls -A .)" ]; then
-             echo "::error::没有下载到任何文件！请检查 packages.txt 内容。"
-             exit 1
-          fi
-          zip -r ../passwall_ipk_ipq60xx_ready.zip .
+          zip -r ../passwall_ipk_ready.zip .
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: passwall_ipk_ipq60xx_ready
-          path: passwall_ipk_ipq60xx_ready.zip
+          name: passwall_ipk_ready
+          path: passwall_ipk_ready.zip
