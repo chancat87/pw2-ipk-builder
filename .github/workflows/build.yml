@@ -36,7 +36,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: lede
-          key: lede-master-ipq60xx
+          key: lede-master-ipq60xx-${{ hashFiles('packages.txt') }}
+          restore-keys: |
+            lede-master-ipq60xx-
 
       - name: Clone or update Lean lede master branch
         run: |
@@ -57,9 +59,14 @@ jobs:
       - name: Add passwall_packages feed
         working-directory: lede
         run: |
+          # 关键修复：先删除旧目录，防止 git clone 冲突
+          rm -rf package/passwall_packages
+          
           git clone --depth=1 --branch "${{ inputs.packages_ref }}" \
             https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git \
             package/passwall_packages
+            
+          # 再次更新 feeds 以索引新加入的包
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
@@ -68,32 +75,49 @@ jobs:
         run: |
           make clean || true
           rm -f .config
+          
+          # 1. 设置目标架构
           echo "CONFIG_TARGET_ipq60xx=y" >> .config
           echo "CONFIG_TARGET_ipq60xx_generic=y" >> .config
           echo "CONFIG_TARGET_ROOTFS_PARTSIZE=512" >> .config
+          
+          # 2. 关键修复：从 packages.txt 读取包名并写入 .config
+          # 只有显式设置为 'm' (编译模块)，编译系统才会正确处理所有依赖
+          while IFS= read -r pkg || [ -n "$pkg" ]; do
+            [[ "$pkg" =~ ^#.*$ ]] && continue
+            [[ -z "$pkg" ]] && continue
+            echo "CONFIG_PACKAGE_$pkg=m" >> .config
+          done < ../packages.txt
+          
+          # 3. 生成完整配置
           make defconfig
 
-      - name: Pre-build host tools
+      - name: Pre-build host tools and toolchain
         working-directory: lede
         run: |
-          make tools/install V=s || true
-          make package/golang/host/compile V=s || true
-          make package/rust/host/compile V=s || true
+          # 增加 toolchain/install 确保交叉编译环境就绪
+          make tools/install -j$(nproc) V=s || true
+          make toolchain/install -j$(nproc) V=s || true
 
       - name: Build dependency packages
         working-directory: lede
         run: |
+          # 此时 .config 已包含 packages.txt 的内容，
+          # 我们可以直接编译，或者用循环确保每个包都被触发
           while IFS= read -r pkg || [ -n "$pkg" ]; do
             [[ "$pkg" =~ ^#.*$ ]] && continue
             [[ -z "$pkg" ]] && continue
-            make package/"$pkg"/clean V=s || true
-            make package/"$pkg"/compile -j$(nproc) V=s || echo "Warning: $pkg failed"
+            echo "Building $pkg ..."
+            make package/"$pkg"/compile -j$(nproc) || make package/"$pkg"/compile -j1 V=s
           done < ../packages.txt
 
       - name: Collect IPK files
         run: |
           mkdir -p artifacts/passwall_packages
-          find lede/bin/packages -name "*.ipk" -exec cp {} artifacts/passwall_packages/ \; 2>/dev/null || true
+          # 稍微放宽 find 条件，确保找到所有生成的 ipk
+          find lede/bin/packages -name "*.ipk" | xargs -I {} cp {} artifacts/passwall_packages/
+          echo "Collected IPKs:"
+          ls -lh artifacts/passwall_packages/
 
       - name: Create zip
         working-directory: artifacts
