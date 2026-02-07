@@ -17,6 +17,23 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
+      - name: Free Disk Space (Ultimate Clean)
+        run: |
+          echo "Starting Disk Space:"
+          df -h
+          echo "Cleaning up..."
+          # 删除大型预装软件，释放约 12GB+ 空间
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/.ghcup
+          sudo docker image prune --all --force 2>/dev/null
+          sudo apt-get -y autoremove --purge
+          sudo apt-get -y clean
+          echo "Final Disk Space:"
+          df -h
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -53,20 +70,19 @@ jobs:
       - name: Update feeds
         working-directory: lede
         run: |
-          # 1. Update default feeds
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
       - name: Add Passwall Source
         working-directory: lede
         run: |
-          # 2. Add passwall source via git clone to avoid feeds.conf conflicts
+          # 清理旧目录
           rm -rf package/passwall_packages
+          # 重新 Clone
           git clone --depth=1 --branch "${{ inputs.packages_ref }}" \
             https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git \
             package/passwall_packages
-          
-          # 3. Install again to index new packages
+          # 再次 Install feeds 确保依赖关系（如 lua, libev）被正确索引
           ./scripts/feeds install -a
 
       - name: Configure Target and Select Packages
@@ -74,20 +90,20 @@ jobs:
         run: |
           rm -f .config
           
-          # 1. Target Configuration (ipq60xx/generic)
+          # 1. 设置 Target (ipq60xx/generic)
           echo "CONFIG_TARGET_ipq60xx=y" >> .config
           echo "CONFIG_TARGET_ipq60xx_generic=y" >> .config
           echo "CONFIG_TARGET_ROOTFS_PARTSIZE=512" >> .config
           
-          # 2. Force Host Tools (Crucial for xray/sing-box)
+          # 2. 强制开启 Host Go/Rust (解决 Xray/Sing-box 编译报错)
           echo "CONFIG_PACKAGE_golang=y" >> .config
           echo "CONFIG_PACKAGE_rust=y" >> .config
           
-          # 3. Select Packages from list
+          # 3. 循环读取 packages.txt 并写入 .config
           while IFS= read -r pkg || [ -n "$pkg" ]; do
             [[ "$pkg" =~ ^#.*$ ]] && continue
             [[ -z "$pkg" ]] && continue
-            # Remove Windows carriage return
+            # 清理 Windows 回车符
             pkg=$(echo "$pkg" | tr -d '\r')
             echo "CONFIG_PACKAGE_$pkg=m" >> .config
           done < ../packages.txt
@@ -97,6 +113,7 @@ jobs:
       - name: Download Sources
         working-directory: lede
         run: |
+          # 预下载源码，避免编译时网络超时
           make download -j8 || make download -j1 V=s
 
       - name: Compile Toolchain and Host Env
@@ -108,8 +125,7 @@ jobs:
           echo "::endgroup::"
           
           echo "::group::Build Host Go/Rust"
-          # Explicitly compile host golang to prevent Xray build failures
-          # find -L finds the path even if it is a symlink
+          # 查找并编译 Host Golang (即使它是软链接)
           go_path=$(find -L package/ -name "golang" -type d | grep "lang/golang" | head -n 1)
           if [ -n "$go_path" ]; then
             echo "Compiling Host Go at $go_path"
@@ -117,26 +133,33 @@ jobs:
           fi
           echo "::endgroup::"
 
-      - name: Build Dependency Packages (Robust)
+      - name: Build Dependency Packages (Priority Mode)
         working-directory: lede
         run: |
           compile_pkg() {
             pkg=$1
             echo "------ Processing: $pkg ------"
             
-            # METHOD 1: Direct Directory Match
-            # Use find -L to follow symlinks (Critical Fix)
+            # 【策略 1】优先检查 Passwall 专用目录 (确保编译的是新版)
+            if [ -d "package/passwall_packages/$pkg" ]; then
+               echo "Found in passwall_packages (Priority): package/passwall_packages/$pkg"
+               make "package/passwall_packages/$pkg/compile" -j$(nproc) || make "package/passwall_packages/$pkg/compile" -j1 V=s || echo "::error::Build failed for $pkg"
+               return
+            fi
+
+            # 【策略 2】全局目录查找 (find -L 穿透软链接)
+            # -print -quit 确保找到一个就停止，减少耗时
             dir_match=$(find -L package/ -type d -name "$pkg" -print -quit)
             
             if [ -n "$dir_match" ]; then
-              echo "Found direct path: $dir_match"
+              echo "Found via directory search: $dir_match"
               make "$dir_match/compile" -j$(nproc) || make "$dir_match/compile" -j1 V=s || echo "::error::Build failed for $pkg"
               return
             fi
 
-            # METHOD 2: Search in Makefiles (The "Safety Net")
-            # This finds "define Package/shadowsocks-rust-sslocal" inside "shadowsocks-rust/Makefile"
-            echo "Searching Makefiles (following symlinks)..."
+            # 【策略 3】Makefile 内容反查 (兜底方案)
+            # 专门解决 shadowsocks-rust-sslocal 这种子包名与目录名不一致的情况
+            echo "Searching Makefiles for definition..."
             makefile_match=$(find -L package/ -name Makefile -maxdepth 6 | xargs grep -l "define Package/$pkg" | head -n 1)
             
             if [ -n "$makefile_match" ]; then
@@ -144,7 +167,7 @@ jobs:
               echo "Found definition in: $src_dir"
               make "$src_dir/compile" -j$(nproc) || make "$src_dir/compile" -j1 V=s || echo "::error::Build failed for $pkg (parent: $src_dir)"
             else
-              echo "::error::FATAL: Could not find package '$pkg'. Checked dir names and Makefile definitions."
+              echo "::error::FATAL: Could not find package '$pkg'. Skipped."
             fi
           }
 
@@ -158,7 +181,7 @@ jobs:
       - name: Collect IPK files
         run: |
           mkdir -p artifacts/passwall_packages
-          # Collect all IPKs, excluding kernel modules
+          # 搜集所有 IPK (排除 kernel 内核包)
           find lede/bin/packages -name "*.ipk" | grep -v "kernel" | xargs -I {} cp {} artifacts/passwall_packages/
           
           count=$(ls artifacts/passwall_packages/ | wc -l)
