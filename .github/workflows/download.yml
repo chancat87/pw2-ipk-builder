@@ -1,4 +1,4 @@
-name: Download Passwall2 IPKs (Strict & Final)
+name: Download Passwall2 IPKs
 
 on:
   workflow_dispatch:
