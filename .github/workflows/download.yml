@@ -1,4 +1,4 @@
-name: Download ALL Passwall2 IPKs (SourceForge Mirror)
+name: Download Passwall2 IPKs (Strict & Final)
 
 on:
   workflow_dispatch:
@@ -6,8 +6,11 @@ on:
 permissions:
   contents: write
 
+env:
+  TZ: Asia/Shanghai  # 确保 Release 时间是北京时间
+
 jobs:
-  download_all:
+  download_strict:
     runs-on: ubuntu-latest
 
     steps:
@@ -22,70 +25,108 @@ jobs:
       - name: Install Dependencies
         run: pip install requests
 
+      - name: Generate Date Tag
+        id: tag
+        run: |
+          # 生成时间标签，例如: 2026.02.08-1430
+          echo "date=$(date +'%Y.%m.%d-%H%M')" >> $GITHUB_OUTPUT
+
       - name: Run Downloader
         run: |
           mkdir -p output
           
-          # 创建全量下载脚本
+          # 编写 Python 下载脚本
           cat << 'EOF' > downloader.py
           import requests
           import os
           import sys
           import gzip
 
-          # 目标源：SourceForge OpenWrt 21.02 ipq60xx 专用源
+          # ================== 严格配置区域 ==================
+          # 仅使用 Moetayuko SourceForge 21.02 源
           BASE_URL = "https://downloads.sourceforge.net/project/openwrt-passwall-build/releases/packages-21.02/aarch64_cortex-a53/passwall_packages"
+          
+          # 伪装 Header
           HEADERS = {'User-Agent': 'Wget/1.21.2 (linux-gnu)', 'Accept': '*/*'}
 
-          # 1. 获取索引 (Packages 文件)
-          print(f"1. 连接源: {BASE_URL}")
-          try:
-              # 尝试下载 Packages
-              r = requests.get(f"{BASE_URL}/Packages", headers=HEADERS, timeout=30, allow_redirects=True)
-              if r.status_code == 404:
-                  print("Packages 纯文本不存在，尝试 Packages.gz...")
-                  r = requests.get(f"{BASE_URL}/Packages.gz", headers=HEADERS, timeout=30, allow_redirects=True)
-                  r.raise_for_status()
-                  content = gzip.decompress(r.content).decode('utf-8', errors='ignore')
-              else:
-                  r.raise_for_status()
-                  content = r.content.decode('utf-8', errors='ignore')
-          except Exception as e:
-              print(f"❌ 索引下载失败: {e}")
-              sys.exit(1)
+          # 严格黑名单 (遇到即跳过)
+          EXCLUDE_KEYWORDS = [
+              "shadowsocksr-libev-ssr-nat",
+              "simple-obfs-server"
+          ]
+          # =================================================
 
-          if "<html" in content.lower():
-              print("❌ 错误: 被 SourceForge 拦截，返回了 HTML 页面。")
-              sys.exit(1)
+          def get_index_content(url):
+              print(f"🔗 连接源: {url}")
+              try:
+                  # 尝试下载 Packages 纯文本
+                  r = requests.get(f"{url}/Packages", headers=HEADERS, timeout=30, allow_redirects=True)
+                  if r.status_code == 404:
+                      print("   Packages 文本未找到，尝试 .gz ...")
+                      r = requests.get(f"{url}/Packages.gz", headers=HEADERS, timeout=30, allow_redirects=True)
+                  
+                  if r.status_code == 200:
+                      # 处理 gzip
+                      content = r.content
+                      if url.endswith('.gz') or content[:2] == b'\x1f\x8b':
+                          return gzip.decompress(content).decode('utf-8', errors='ignore')
+                      return content.decode('utf-8', errors='ignore')
+                  return None
+              except Exception as e:
+                  print(f"❌ 连接失败: {e}")
+                  return None
 
-          # 2. 解析所有文件名
-          filenames = []
-          for line in content.splitlines():
-              line = line.strip()
-              if line.startswith("Filename:"):
-                  fname = line.split(":", 1)[1].strip()
-                  if fname.endswith(".ipk"):
-                      filenames.append(fname)
+          def parse_filenames(content):
+              files = []
+              if not content: return files
+              for line in content.splitlines():
+                  line = line.strip()
+                  # 从索引中提取所有 Filename
+                  if line.startswith("Filename:"):
+                      filename = line.split(":", 1)[1].strip()
+                      if filename.endswith(".ipk"):
+                          files.append(filename)
+              # 去重排序
+              return sorted(list(set(files)))
+
+          # --- 主程序开始 ---
           
-          # 去重
-          filenames = sorted(list(set(filenames)))
-          total_files = len(filenames)
-          print(f"✅ 索引解析成功，源中共有 {total_files} 个 IPK 文件。")
-          print("🚀 准备全部下载！")
+          # 1. 获取文件列表
+          print("1. 获取软件源索引...")
+          content = get_index_content(BASE_URL)
+          
+          if not content:
+              print("❌ 严重错误: 无法下载索引文件。")
+              sys.exit(1)
+              
+          if "<html" in content.lower():
+              print("❌ 错误: 下载到的是 HTML 页面，非索引文件。")
+              sys.exit(1)
 
-          # 3. 批量下载
+          all_files = parse_filenames(content)
+          print(f"✅ 索引解析成功，源中共有 {len(all_files)} 个 IPK 文件。")
+
+          # 2. 过滤与下载
           downloaded_count = 0
           
-          for i, filename in enumerate(filenames, 1):
+          print("\n2. 开始批量下载...")
+          for i, filename in enumerate(all_files, 1):
+              # --- 黑名单检查 ---
+              is_excluded = False
+              for keyword in EXCLUDE_KEYWORDS:
+                  if keyword in filename:
+                      print(f"[{i}/{len(all_files)}] 🚫 已屏蔽: {filename}")
+                      is_excluded = True
+                      break
+              if is_excluded:
+                  continue
+              
+              # --- 下载逻辑 ---
               file_url = f"{BASE_URL}/{filename}"
               save_path = f"output/{filename}"
               
-              print(f"[{i}/{total_files}] 下载: {filename}")
+              print(f"[{i}/{len(all_files)}] ⬇️ 下载: {filename}")
               
-              if os.path.exists(save_path):
-                  print("   ⏩ 已存在，跳过")
-                  continue
-
               try:
                   with requests.get(file_url, headers=HEADERS, stream=True, timeout=60) as r:
                       r.raise_for_status()
@@ -96,37 +137,41 @@ jobs:
                   if os.path.getsize(save_path) > 1024:
                       downloaded_count += 1
                   else:
-                      print("   ⚠️ 失败: 文件过小")
+                      print("      ⚠️ 文件过小，删除")
                       if os.path.exists(save_path): os.remove(save_path)
               except Exception as e:
-                  print(f"   ❌ 下载异常: {e}")
+                  print(f"      ❌ 下载异常: {e}")
 
-          print(f"\n🎉 任务完成！成功下载 {downloaded_count} / {total_files} 个文件。")
+          print(f"\n🎉 任务完成！实际下载 {downloaded_count} 个文件。")
           if downloaded_count == 0:
               sys.exit(1)
           EOF
           
+          # 执行脚本
           python3 downloader.py
 
       - name: Create Zip for Release
         run: |
           cd output
-          # 打包所有下载下来的 ipk
-          zip -r ../passwall_packages_all_ipq60xx.zip .
+          # 严格按照要求的命名打包
+          zip -r ../passwall_packages_arch64_cortex-a53-\(ipq60xx\).zip .
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-all-${{ github.run_number }}
-          name: Build ${{ github.run_number }} (All Packages)
+          tag_name: ${{ steps.tag.outputs.date }}
+          name: Auto Build ${{ steps.tag.outputs.date }}
           body: |
-            ✅ 已从 SourceForge 全量下载所有 Passwall 依赖包。
+            ✅ Passwall2 依赖包自动提取 (SourceForge 21.02 Only)
             
-            **信息摘要：**
-            - 源：`moetayuko/openwrt-passwall-build` (packages-21.02)
-            - 架构：`aarch64_cortex-a53` (ipq60xx)
-            - 策略：全量下载 (Download All)
+            **构建信息：**
+            - 时间: ${{ steps.tag.outputs.date }} (北京时间)
+            - 架构: aarch64_cortex-a53 (ipq60xx)
+            - 来源: Moetayuko (SourceForge)
             
-            📦 **包含了 xray, sing-box, shadowsocks 等所有相关组件**
-            请下载 zip 后解压，根据需要选择安装。
-          files: passwall_packages_all_ipq60xx.zip
+            **已排除:**
+            - `shadowsocksr-libev-ssr-nat`
+            - `simple-obfs-server`
+            
+            ⬇️ **点击下方 zip 下载**
+          files: passwall_packages_arch64_cortex-a53-(ipq60xx).zip
